@@ -15,35 +15,75 @@ jobs:
     runs-on: ubuntu-latest
     name: Build and Deploy Job
     permissions:
-       id-token: write
-       contents: read
+      id-token: write
+      contents: read
     steps:
+      # Checkout repo
       - uses: actions/checkout@v3
-        with:
-          submodules: true
-          lfs: false
-      - name: Install OIDC Client from Core Package
-        run: npm install @actions/core@1.6.0 @actions/http-client
-      - name: Get Id Token
-        uses: actions/github-script@v6
+
+      # Generate index.html dynamically from scripts folder
+      - name: Generate HTML
+        run: |
+          mkdir -p ./generated
+          node -e "
+          const fs = require('fs');
+          const path = require('path');
+          const scriptsDir = './scripts';
+          const files = fs.existsSync(scriptsDir) ? fs.readdirSync(scriptsDir) : [];
+          let html = `<!DOCTYPE html>
+            <html lang='nl'>
+            <head>
+            <meta charset='UTF-8'>
+            <title>Scripts</title>
+            <link rel='stylesheet' href='style.css'>
+            </head>
+            <body>
+            <main>
+            <h1>Content</h1>
+            <ul class='script-list'>\n`;
+                      for (const file of files) {
+                        html += `<li>
+            <div class='line-content'>
+            <a href='scripts/${file}'>${file}</a> ${file.replace(/[-.]/g,' ')}
+            <button class='copy-btn'>Copy</button>
+            </div>
+            </li>\n`;
+                      }
+                      html += `</ul>
+            </main>
+            <script>
+            document.querySelectorAll('.copy-btn').forEach(btn => {
+              btn.addEventListener('click', () => {
+                const link = btn.previousElementSibling;
+                navigator.clipboard.writeText(link.href).then(() => {
+                  btn.textContent='Copied!';
+                  setTimeout(() => btn.textContent='Copy',1000);
+                });
+              });
+            });
+            </script>
+            </body>
+            </html>`;
+                      fs.writeFileSync('index.html', html);
+          "
+
+      # Get GitHub OIDC token
+      - name: Get GitHub OIDC token
         id: idtoken
+        uses: actions/github-script@v6
         with:
-           script: |
-               const coredemo = require('@actions/core')
-               return await coredemo.getIDToken()
-           result-encoding: string
+          script: |
+            return await core.getIDToken();
+          result-encoding: string
+
+      # Deploy to Azure Static Web Apps
       - name: Build And Deploy
-        id: builddeploy
         uses: Azure/static-web-apps-deploy@v1
         with:
+          action: upload
+          app_location: "/"          # Root van de repo
           skip_app_build: true
-          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_LIVELY_MUD_08FF60D03 }}
-          action: "upload"
-          ###### Repository/Build Configurations - These values can be configured to match your app requirements. ######
-          # For more information regarding Static Web App workflow configurations, please visit: https://aka.ms/swaworkflowconfig
-          app_location: "/" # App source code path
           github_id_token: ${{ steps.idtoken.outputs.result }}
-          ###### End of Repository/Build Configurations ######
 
   close_pull_request_job:
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
@@ -51,7 +91,6 @@ jobs:
     name: Close Pull Request Job
     steps:
       - name: Close Pull Request
-        id: closepullrequest
         uses: Azure/static-web-apps-deploy@v1
         with:
           action: "close"
