@@ -1,374 +1,528 @@
-#!/bin/bash
-# Creators: Chiel Demmer, Sten Tijhuis
-
-#########################################################################
-# NGINX Compiler and Installer
-# 
-# This script compiles and installs NGINX with OpenSSL from source
-# 
-# NGINX releases repository: https://github.com/nginx/nginx/releases
-# 
-# Version information:
-# - 1.29.x: mainline branch (newer features, less stable) - this installer is using 1.29.1
-# - 1.28.x: stable branch (recommended for production)    - not used in this script 
-# 
-# OpenSSL releases repository: https://github.com/openssl/openssl/releases
-# - Latest stable: 3.5.2
-# 
-# This script downloads source code, verifies checksums, compiles, and
-# installs NGINX with the latest OpenSSL for HTTP/3 support.
-#########################################################################
-
-# Safer error handling
+#!/usr/bin/env bash
 set -euo pipefail
 
-# Version definitions
-NGINX_VERSION="1.29.1"
-OPENSSL_VERSION="3.5.2"
-PCRE2_VERSION="10.45"
-ZLIB_VERSION="1.3.1"
+# ============================================================================
+# NGINX Installer Script for Linux (Bash)
+# ============================================================================
+#
+# Description:
+#   Builds and installs NGINX with OpenSSL 3.6, HTTP/3, zstd compression,
+#   and ACME support on Linux.
+#
+# Usage:
+#   ./install-nginx.sh install    - Build and install NGINX
+#   ./install-nginx.sh remove     - Uninstall NGINX
+#
+# ============================================================================
 
-# SHA256 checksums for verification
-# These are the actual checksums for the specified versions
-NGINX_SHA256="c589f7e7ed801ddbd904afbf3de26ae24eb0cce27c7717a2e94df7fb12d6ad27"
-OPENSSL_SHA256="c53a47e5e441c930c3928cf7bf6fb00e5d129b630e0aa873b08258656e7345ec"
+# Early syntax check
+if ! bash -n "$0" >/dev/null 2>&1; then
+    echo "ERROR: Syntax check failed for $0" >&2
+    exit 1
+fi
 
-# Build configuration
-BUILD_DIR="/tmp/nginx-build-$$"
-PREFIX="/usr/local/nginx"
-LOG_DIR="/tmp/nginx-build-logs-$$"
+# ============================================================================
+# Version Configuration
+# ============================================================================
 
-# Color definitions
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly PURPLE='\033[0;35m'
-readonly NC='\033[0m' # No Color
-readonly BOLD='\033[1m'
+# NGINX
+NGINX_VERSION="1.29.5"
+NGINX_SHA256="6744768a4114880f37b13a0443244e731bcb3130c0a065d7e37d8fd589ade374"
 
-# Additional configuration
-readonly BACKUP_DIR="/root/nginx-backup-$(date +%Y%m%d-%H%M%S)"
-readonly SERVICE_NAME="nginx"
+# OpenSSL
+OPENSSL_VERSION="3.6.1"
+OPENSSL_SHA256="b1bfedcd5b289ff22aee87c9d600f515767ebf45f77168cb6d64f231f518a82e"
 
-# Create directories
-mkdir -p "$BUILD_DIR" "$LOG_DIR"
+# PCRE2
+PCRE2_VERSION="10.47"
+PCRE2_SHA256="c08ae2388ef333e8403e670ad70c0a11f1eed021fd88308d7e02f596fcd9dc16"
 
-# Logging functions
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
-log_error() { echo -e "${RED}[✗]${NC} $1" >&2; }
-log_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-log_step() { echo -e "${PURPLE}[→]${NC} ${BOLD}$1${NC}"; }
+# Zlib
+ZLIB_VERSION="1.3.2"
+ZLIB_SHA256="bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
 
-# Cleanup function
-cleanup() {
-    if [ -n "$BUILD_DIR" ] && [ -d "$BUILD_DIR" ]; then
-        rm -rf "$BUILD_DIR"
-    fi
-    if [ -n "$LOG_DIR" ] && [ -d "$LOG_DIR" ]; then
-        rm -rf "$LOG_DIR"
-    fi
+# Headers-More Module
+HEADERS_MORE_VERSION="0.39"
+HEADERS_MORE_SHA256="dde68d3fa2a9fc7f52e436d2edc53c6d703dcd911283965d889102d3a877c778"
+
+# Zstd Module
+ZSTD_MODULE_VERSION="0.1.1"
+ZSTD_MODULE_SHA256="707d534f8ca4263ff043066db15eac284632aea875f9fe98c96cea9529e15f41"
+
+# ACME Module
+ACME_MODULE_VERSION="0.3.1"
+ACME_MODULE_SHA256="be3d3d10f042930a3bf348731698eadb7003d224a863c53b719ccd28721572c3"
+
+# ============================================================================
+# Static Configuration
+# ============================================================================
+
+BUILD_DIR="/tmp/nginx-build-$(date +%Y%m%d-%H%M%S)"
+BACKUP_DIR="/var/lib/nginx-backup-$(date +%Y%m%d-%H%M%S)"
+LOG_FILE="/var/log/nginx-installer-$(date +%Y%m%d-%H%M%S).log"
+
+# FHS-compliant install paths (matching what dnf/rpm would use)
+NGINX_PREFIX="/usr/share/nginx"
+case "$(uname -m)" in
+    x86_64|aarch64) NGINX_LIBDIR="/usr/lib64" ;;
+    *)              NGINX_LIBDIR="/usr/lib" ;;
+esac
+NGINX_MODULES_PATH="${NGINX_LIBDIR}/nginx/modules"
+
+# Download URLs
+NGINX_URL="https://github.com/nginx/nginx/releases/download/release-${NGINX_VERSION}/nginx-${NGINX_VERSION}.tar.gz"
+OPENSSL_URL="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+PCRE2_URL="https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz"
+ZLIB_URL="https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
+HEADERS_MORE_URL="https://github.com/openresty/headers-more-nginx-module/archive/refs/tags/v${HEADERS_MORE_VERSION}.tar.gz"
+ZSTD_MODULE_URL="https://github.com/tokers/zstd-nginx-module/archive/refs/tags/${ZSTD_MODULE_VERSION}.tar.gz"
+ACME_MODULE_URL="https://github.com/nginx/nginx-acme/releases/download/v${ACME_MODULE_VERSION}/nginx-acme-${ACME_MODULE_VERSION}.tar.gz"
+
+# Initialize logging
+mkdir -p "$(dirname "$LOG_FILE")" "$BUILD_DIR"
+exec > >(tee -a "$LOG_FILE")
+exec 2>&1
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+Write-Log() {
+    local level=$1
+    local msg=$2
+    echo "[$level] $msg" >&2
 }
-trap cleanup EXIT INT TERM
 
-# Check for root privileges
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        log_error "This script must be run as root"
-        echo -e "Usage: sudo $0"
-        exit 1
-    fi
+Stop-Script() {
+    Write-Log ERROR "$1"
+    exit 1
 }
 
-# Print header
-print_header() {
-    echo
-    echo -e "${BOLD}NGINX Compiler and Installer${NC}"
-    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "Compiling NGINX ${NGINX_VERSION} with OpenSSL ${OPENSSL_VERSION}"
-    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo
+Test-Hash() {
+    local file=$1
+    local expected=$2
+    local actual
+    actual=$(sha256sum "$file" | awk '{print $1}')
+    [[ "$actual" == "$expected" ]] || Stop-Script "Checksum failed: $file"
 }
 
-# Verify file checksums
-verify_checksum() {
-    local file="$1"
-    local expected_sha="$2"
+Get-File() {
+    local url=$1
+    local file=$2
+    local sha=$3
     
-    if [ -z "$expected_sha" ]; then
-        log_warn "No checksum available for $file - skipping verification"
+    if [[ -f "$file" ]]; then
+        Test-Hash "$file" "$sha"
         return 0
     fi
     
-    local actual_sha
-    actual_sha=$(sha256sum "$file" | cut -d' ' -f1)
-    
-    if [ "$actual_sha" = "$expected_sha" ]; then
-        log_success "Checksum verified for $file"
-        return 0
+    Write-Log INFO "Downloading $(basename "$file")..."
+    curl -fsSL "$url" -o "$file" || Stop-Script "Download failed: $url"
+    Test-Hash "$file" "$sha"
+}
+
+Detect-PkgMgr() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
     else
-        log_error "Checksum mismatch for $file"
-        log_error "Expected: $expected_sha"
-        log_error "Actual:   $actual_sha"
-        return 1
+        echo "unknown"
     fi
 }
 
-# Install dependencies
-install_dependencies() {
-    log_step "Installing build dependencies"
+# ============================================================================
+# System Dependencies
+# ============================================================================
+
+Install-Dependencies() {
+    [[ $EUID -eq 0 ]] || Stop-Script "Run as root"
+    command -v curl >/dev/null 2>&1 || Stop-Script "curl required"
     
-    if command -v apt-get &>/dev/null; then
-        log_info "Detected Debian/Ubuntu system"
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq &>"$LOG_DIR/apt-update.log"
-        if [ $? -ne 0 ]; then
-            log_error "Failed to update package repositories. Check $LOG_DIR/apt-update.log"
-            exit 1
-        fi
-        apt-get install -y build-essential libpcre2-dev zlib1g-dev perl wget gcc make hostname &>"$LOG_DIR/apt-install.log"
-        if [ $? -ne 0 ]; then
-            log_error "Failed to install build dependencies. Check $LOG_DIR/apt-install.log"
-            exit 1
-        fi
-    elif command -v dnf &>/dev/null; then
-        log_info "Detected Fedora/RHEL system"
-        if dnf --version 2>/dev/null | grep -q "dnf5"; then
-            dnf install -y @development-tools &>"$LOG_DIR/dnf-install.log"
+    Write-Log INFO "Installing build dependencies"
+    
+    local mgr
+    mgr=$(Detect-PkgMgr)
+    
+    case $mgr in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq >/dev/null 2>&1
+            apt-get install -y build-essential libpcre2-dev zlib1g-dev libzstd-dev curl gcc make cargo pkg-config clang gawk cmake >/dev/null 2>&1
+            ;;
+        dnf)
+            dnf install -y -q gcc gcc-c++ make pcre2-devel zlib-devel libzstd-devel curl perl cargo pkgconf-pkg-config clang gawk cmake >/dev/null 2>&1
+            ;;
+        *)
+            Stop-Script "Unsupported package manager. Only apt and dnf are supported."
+            ;;
+    esac
+    
+    # Verify cargo availability
+    if ! command -v cargo >/dev/null 2>&1; then
+        Write-Log WARN "Cargo not found. Installing rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env"
+    fi
+    
+    Write-Log INFO "Dependencies installed"
+}
+
+Update-SystemPackages() {
+    [[ $EUID -eq 0 ]] || Stop-Script "Run as root"
+    
+    Write-Log INFO "Updating system packages"
+    
+    local mgr
+    mgr=$(Detect-PkgMgr)
+    
+    case $mgr in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq || Write-Log WARN "apt-get update failed"
+            apt-get upgrade -y -q || Stop-Script "apt-get upgrade failed"
+            ;;
+        dnf)
+            dnf upgrade -y -q || Stop-Script "dnf upgrade failed"
+            ;;
+        *)
+            Write-Log WARN "Unable to detect package manager"
+            ;;
+    esac
+    
+    Write-Log INFO "System packages updated"
+}
+
+# ============================================================================
+# Download Sources
+# ============================================================================
+
+Get-Sources() {
+    cd "$BUILD_DIR" || Stop-Script "Cannot cd to BUILD_DIR: $BUILD_DIR"
+    
+    Write-Log INFO "Downloading sources"
+    
+    Get-File "$NGINX_URL" "nginx.tgz" "$NGINX_SHA256"
+    Get-File "$OPENSSL_URL" "openssl.tgz" "$OPENSSL_SHA256"
+    Get-File "$PCRE2_URL" "pcre2.tgz" "$PCRE2_SHA256"
+    Get-File "$ZLIB_URL" "zlib.tgz" "$ZLIB_SHA256"
+    Get-File "$HEADERS_MORE_URL" "headers.tgz" "$HEADERS_MORE_SHA256"
+    Get-File "$ZSTD_MODULE_URL" "zstd.tgz" "$ZSTD_MODULE_SHA256"
+    Get-File "$ACME_MODULE_URL" "acme.tgz" "$ACME_MODULE_SHA256"
+    
+    Write-Log INFO "Extracting archives"
+    
+    # Clean previous extractions
+    rm -rf nginx openssl pcre2 zlib headers-more zstd-module nginx-acme 2>/dev/null || true
+    
+    tar xzf nginx.tgz && mv "nginx-${NGINX_VERSION}" nginx
+    tar xzf openssl.tgz && mv "openssl-${OPENSSL_VERSION}" openssl
+    tar xzf pcre2.tgz && mv "pcre2-${PCRE2_VERSION}" pcre2
+    tar xzf zlib.tgz && mv "zlib-${ZLIB_VERSION}" zlib
+    tar xzf headers.tgz && mv "headers-more-nginx-module-${HEADERS_MORE_VERSION}" headers-more
+    tar xzf zstd.tgz && mv "zstd-nginx-module-${ZSTD_MODULE_VERSION}" zstd-module
+    tar xzf acme.tgz && mv "nginx-acme-${ACME_MODULE_VERSION}" nginx-acme
+    
+    Write-Log INFO "Sources ready"
+}
+
+# ============================================================================
+# Build Functions
+# ============================================================================
+
+Build-Nginx() {
+    local use_system_ssl=false
+    local ssl_opt=""
+    
+    # Detect WSL ARM64 and fall back to system OpenSSL
+    if [[ $(uname -r) =~ microsoft ]] && [[ $(uname -m) == aarch64 ]]; then
+        Write-Log WARN "WSL ARM64 detected - using system OpenSSL"
+        use_system_ssl=true
+    fi
+    
+    # Clean compiler temp files (not the build dir itself — managed by EXIT trap)
+    rm -rf /tmp/cc* /tmp/tmp.* 2>/dev/null || true
+    
+    # Check disk space in /tmp
+    local tmp_space
+    tmp_space=$(df /tmp | tail -1 | awk '{print $4}')
+    if [[ $tmp_space -lt 1048576 ]]; then
+        Write-Log WARN "Low disk space in /tmp, using build directory"
+        export TMPDIR="$BUILD_DIR"
+    fi
+    
+    # Ensure cc symlink exists
+    if ! command -v cc >/dev/null 2>&1; then
+        ln -sf /usr/bin/gcc /usr/local/bin/cc 2>/dev/null || true
+        export PATH="/usr/local/bin:$PATH"
+    fi
+    
+    # Build OpenSSL standalone for ACME module
+    if [[ $use_system_ssl == false ]]; then
+        Write-Log INFO "Building OpenSSL ${OPENSSL_VERSION} (Standalone)"
+        cd "$BUILD_DIR/openssl" || Stop-Script "OpenSSL source missing"
+        
+        local arch
+        arch=$(uname -m)
+        case $arch in
+            x86_64)  arch="linux-x86_64" ;;
+            aarch64) arch="linux-aarch64" ;;
+            armv7l)  arch="linux-armv4" ;;
+            *)       arch="linux-generic64" ;;
+        esac
+        
+        export TMPDIR="$BUILD_DIR"
+        export CC=gcc
+        
+        local output configure_exit
+        output=$(./Configure "$arch" \
+            --prefix="$(pwd)/../openssl-install" \
+            --openssldir="$(pwd)/../openssl-install/ssl" \
+            enable-tls1_3 shared -fPIC 2>&1) && configure_exit=0 || configure_exit=$?
+        output=$(printf '%s\n' "$output" | grep -v '^DEBUG:' | grep -v '^No value given' || true)
+        if [[ $configure_exit -ne 0 ]]; then
+            use_system_ssl=true
+            Write-Log WARN "OpenSSL configure failed"
         else
-            dnf groupinstall -y "Development Tools" &>"$LOG_DIR/dnf-install.log"
+            local make_exit
+            output=$(make -j"$(nproc)" 2>&1) && make_exit=0 || make_exit=$?
+            output=$(printf '%s\n' "$output" | grep -v '^DEBUG:' || true)
+            if [[ $make_exit -ne 0 ]]; then
+                use_system_ssl=true
+                Write-Log WARN "OpenSSL build failed"
+            else
+                make install_sw 2>&1 | grep -v '^DEBUG:' || true
+                ssl_opt="--with-openssl=$BUILD_DIR/openssl"
+                Write-Log INFO "OpenSSL built successfully"
+            fi
         fi
-        if [ $? -ne 0 ]; then
-            log_error "Failed to install development tools. Check $LOG_DIR/dnf-install.log"
-            exit 1
-        fi
-        dnf install -y pcre2-devel zlib-devel perl wget gcc make hostname &>"$LOG_DIR/dnf-install.log"
-        if [ $? -ne 0 ]; then
-            log_error "Failed to install build dependencies. Check $LOG_DIR/dnf-install.log"
-            exit 1
-        fi
-    elif command -v yum &>/dev/null; then
-        log_info "Detected CentOS/RHEL system"
-        yum groupinstall -y "Development Tools" &>"$LOG_DIR/yum-install.log"
-        if [ $? -ne 0 ]; then
-            log_error "Failed to install development tools. Check $LOG_DIR/yum-install.log"
-            exit 1
-        fi
-        yum install -y pcre2-devel zlib-devel perl wget gcc make hostname &>"$LOG_DIR/yum-install.log"
-        if [ $? -ne 0 ]; then
-            log_error "Failed to install build dependencies. Check $LOG_DIR/yum-install.log"
-            exit 1
+    fi
+    
+    # Fallback to system OpenSSL
+    if [[ $use_system_ssl == true ]]; then
+        local mgr
+        mgr=$(Detect-PkgMgr)
+        case $mgr in
+            apt) apt-get install -y libssl-dev >/dev/null 2>&1 ;;
+            dnf) dnf install -y openssl-devel >/dev/null 2>&1 ;;
+        esac
+        Write-Log INFO "Using system OpenSSL"
+    fi
+    
+    # Build NGINX
+    Write-Log INFO "Building Nginx ${NGINX_VERSION}"
+    cd "$BUILD_DIR/nginx" || Stop-Script "Nginx source missing"
+    
+    export TMPDIR="$BUILD_DIR"
+    export CC=gcc
+    
+    # Verify libzstd availability
+    if command -v ldconfig >/dev/null 2>&1; then
+        if ! ldconfig -p 2>/dev/null | grep -q "libzstd.so"; then
+            Stop-Script "Shared libzstd not found. Install libzstd-dev/devel"
         fi
     else
-        log_error "Unsupported package manager. This script requires apt, dnf, or yum."
-        exit 1
+        if [[ ! -f /usr/lib/libzstd.so && ! -f /usr/lib64/libzstd.so && ! -f /usr/local/lib/libzstd.so ]]; then
+            Stop-Script "Shared libzstd not found"
+        fi
     fi
     
-    log_success "Build dependencies installed"
-}
-
-# Create backup of existing NGINX installation
-backup_existing() {
-    log_step "Creating backup of existing installation"
+    export LDFLAGS="-lzstd"
     
-    mkdir -p "$BACKUP_DIR"
-    
-    # Backup existing NGINX configuration
-    if [ -d "/etc/nginx" ]; then
-        cp -a /etc/nginx "$BACKUP_DIR/"
-        log_info "NGINX configuration backed up to $BACKUP_DIR"
-    fi
-    
-    # Backup existing NGINX binary
-    if [ -f "/usr/sbin/nginx" ]; then
-        cp /usr/sbin/nginx "$BACKUP_DIR/"
-        log_info "NGINX binary backed up to $BACKUP_DIR"
-    fi
-    
-    # Save current NGINX service status
-    if systemctl is-active --quiet nginx &>/dev/null; then
-        echo "nginx was active" > "$BACKUP_DIR/service_status.txt"
-    else
-        echo "nginx was inactive" > "$BACKUP_DIR/service_status.txt"
-    fi
-    
-    log_success "Backup created successfully"
-}
-
-# Download and verify sources
-download_sources() {
-    log_step "Downloading source files"
-    
-    cd "$BUILD_DIR" || exit 1
-    
-    # Download sources
-    log_info "Downloading NGINX ${NGINX_VERSION}"
-    wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -O "nginx-${NGINX_VERSION}.tar.gz"
-    
-    log_info "Downloading OpenSSL ${OPENSSL_VERSION}"
-    wget -q "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
-    
-    log_info "Downloading PCRE2 ${PCRE2_VERSION}"
-    wget -q "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz"
-    
-    log_info "Downloading zlib ${ZLIB_VERSION}"
-    wget -q "https://zlib.net/zlib-${ZLIB_VERSION}.tar.gz"
-    
-    # Verify checksums
-    log_info "Verifying checksums"
-    verify_checksum "nginx-${NGINX_VERSION}.tar.gz" "$NGINX_SHA256" || exit 1
-    verify_checksum "openssl-${OPENSSL_VERSION}.tar.gz" "$OPENSSL_SHA256" || exit 1
-    
-    # Extract sources
-    log_info "Extracting source files"
-    tar xf "nginx-${NGINX_VERSION}.tar.gz" || exit 1
-    tar xf "openssl-${OPENSSL_VERSION}.tar.gz" || exit 1
-    tar xf "pcre2-${PCRE2_VERSION}.tar.gz" || exit 1
-    tar xf "zlib-${ZLIB_VERSION}.tar.gz" || exit 1
-    
-    log_success "Source files downloaded and extracted"
-}
-
-# Build OpenSSL
-build_openssl() {
-    log_step "Building OpenSSL ${OPENSSL_VERSION}"
-    
-    cd "$BUILD_DIR/openssl-${OPENSSL_VERSION}" || exit 1
-    
-    ./Configure linux-x86_64 \
-        --prefix="$BUILD_DIR/openssl-install" \
-        --openssldir="$BUILD_DIR/openssl-install/ssl" \
-        enable-tls1_3 \
-        no-shared \
-        no-tests \
-        -fPIC \
-        -O3 &>"$LOG_DIR/openssl-build.log"
-    
-    make -j"$(nproc)" &>"$LOG_DIR/openssl-make.log"
-    make install_sw &>"$LOG_DIR/openssl-install.log"
-    
-    if [ $? -eq 0 ]; then
-        log_success "OpenSSL built successfully"
-    else
-        log_error "OpenSSL build failed. Check logs in $LOG_DIR"
-        exit 1
-    fi
-    
-    cd "$BUILD_DIR" || exit 1
-}
-
-# Configure and build NGINX
-build_nginx() {
-    log_step "Configuring NGINX ${NGINX_VERSION}"
-    
-    cd "$BUILD_DIR/nginx-${NGINX_VERSION}" || exit 1
-    
-    # Set build flags
-    export CFLAGS="-I${BUILD_DIR}/openssl-install/include -O3"
-    export LDFLAGS="-L${BUILD_DIR}/openssl-install/lib64 -L${BUILD_DIR}/openssl-install/lib"
-    
-    ./configure \
-        --prefix="$PREFIX" \
+    local output
+    if ! output=$(./configure \
+        --with-compat \
+        --prefix="${NGINX_PREFIX}" \
         --sbin-path=/usr/sbin/nginx \
         --conf-path=/etc/nginx/nginx.conf \
-        --error-log-path=/var/log/nginx/error.log \
         --http-log-path=/var/log/nginx/access.log \
+        --error-log-path=/var/log/nginx/error.log \
         --pid-path=/run/nginx.pid \
-        --lock-path=/run/nginx.lock \
-        --http-client-body-temp-path=/var/cache/nginx/client_temp \
-        --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
-        --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
-        --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
-        --http-scgi-temp-path=/var/cache/nginx/scgi_temp \
-        --user=nginx \
-        --group=nginx \
-        --with-openssl="$BUILD_DIR/openssl-${OPENSSL_VERSION}" \
-        --with-pcre="$BUILD_DIR/pcre2-${PCRE2_VERSION}" \
+        --lock-path=/run/lock/nginx.lock \
+        --http-client-body-temp-path=/var/lib/nginx/tmp/client_body \
+        --http-proxy-temp-path=/var/lib/nginx/tmp/proxy \
+        --http-fastcgi-temp-path=/var/lib/nginx/tmp/fastcgi \
+        --http-uwsgi-temp-path=/var/lib/nginx/tmp/uwsgi \
+        --http-scgi-temp-path=/var/lib/nginx/tmp/scgi \
+        $ssl_opt \
+        --with-pcre="$BUILD_DIR/pcre2" \
+        --with-zlib="$BUILD_DIR/zlib" \
         --with-pcre-jit \
-        --with-zlib="$BUILD_DIR/zlib-${ZLIB_VERSION}" \
-        --with-compat \
-        --with-file-aio \
-        --with-threads \
-        --with-http_addition_module \
-        --with-http_auth_request_module \
-        --with-http_dav_module \
-        --with-http_flv_module \
-        --with-http_gunzip_module \
-        --with-http_gzip_static_module \
-        --with-http_mp4_module \
-        --with-http_random_index_module \
-        --with-http_realip_module \
-        --with-http_secure_link_module \
-        --with-http_slice_module \
         --with-http_ssl_module \
-        --with-http_stub_status_module \
-        --with-http_sub_module \
         --with-http_v2_module \
         --with-http_v3_module \
-        --with-ld-opt="$LDFLAGS" &>"$LOG_DIR/nginx-configure.log"
-    
-    if [ $? -ne 0 ]; then
-        log_error "NGINX configuration failed. Check $LOG_DIR/nginx-configure.log"
-        exit 1
+        --with-http_gzip_static_module \
+        --with-http_stub_status_module \
+        --with-http_realip_module \
+        --with-http_sub_module \
+        --with-http_secure_link_module \
+        --with-stream \
+        --with-stream_ssl_module \
+        --with-stream_ssl_preread_module \
+        --with-stream_realip_module \
+        --with-file-aio \
+        --with-threads \
+        --modules-path="${NGINX_MODULES_PATH}" \
+        --add-dynamic-module="$BUILD_DIR/headers-more" \
+        --add-dynamic-module="$BUILD_DIR/zstd-module" \
+        2>&1); then
+        Write-Log ERROR "Configure output: $(echo "$output" | tail -20)"
+        Stop-Script "Configure failed"
     fi
     
-    log_step "Building NGINX"
-    make -j"$(nproc)" &>"$LOG_DIR/nginx-build.log"
-    
-    if [ $? -eq 0 ]; then
-        log_success "NGINX built successfully"
-    else
-        log_error "NGINX build failed. Check $LOG_DIR/nginx-build.log"
-        exit 1
+    # Patch Makefile for shared libzstd
+    if [[ -f "objs/Makefile" ]]; then
+        Write-Log INFO "Patching nginx Makefile for shared libzstd"
+        sed -i 's/-l:libzstd\.a/-lzstd/g' "objs/Makefile"
     fi
+    
+    if ! output=$(make -j"$(nproc)" 2>&1); then
+        Write-Log ERROR "Make output: $(echo "$output" | tail -20)"
+        Stop-Script "Build failed"
+    fi
+    
+    # Build ACME Module
+    Write-Log INFO "Building ACME module ${ACME_MODULE_VERSION}"
+    cd "$BUILD_DIR/nginx-acme" || Stop-Script "ACME source missing"
+    
+    export NGINX_BUILD_DIR="$BUILD_DIR/nginx/objs"
+    export NGX_ACME_STATE_PREFIX="/var/cache/nginx"
+    
+    if [[ -f "$HOME/.cargo/env" ]]; then
+        source "$HOME/.cargo/env"
+    fi
+    
+    # Verify Rust toolchain
+    if ! command -v rustc >/dev/null 2>&1; then
+        Write-Log WARN "rustc not found, installing rustup"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env"
+    fi
+    
+    # Setup OpenSSL for Rust
+    if [[ -d "$BUILD_DIR/openssl-install" ]]; then
+        export OPENSSL_DIR="$BUILD_DIR/openssl-install"
+        if [[ -d "$BUILD_DIR/openssl-install/lib64" ]]; then
+            export OPENSSL_LIB_DIR="$BUILD_DIR/openssl-install/lib64"
+        else
+            export OPENSSL_LIB_DIR="$BUILD_DIR/openssl-install/lib"
+        fi
+        export OPENSSL_INCLUDE_DIR="$BUILD_DIR/openssl-install/include"
+        export OPENSSL_STATIC=1
+        Write-Log INFO "Using custom OpenSSL for ACME (Static Link): $OPENSSL_DIR"
+    fi
+    
+    local cargo_output
+    if ! cargo_output=$(cargo build --release 2>&1); then
+        Write-Log ERROR "ACME build failed: $(echo "$cargo_output" | tail -20)"
+        Stop-Script "ACME module build failed"
+    fi
+    
+    mkdir -p "$BUILD_DIR/nginx-acme/objs"
+    cp target/release/libnginx_acme.so "$BUILD_DIR/nginx-acme/objs/ngx_http_acme_module.so" || true
+    
+    Write-Log INFO "ACME module built successfully"
+    Write-Log INFO "Build complete"
 }
 
-# Install NGINX files and configure system
-install_nginx() {
-    log_step "Installing NGINX"
+# ============================================================================
+# Configuration Functions
+# ============================================================================
+
+Install-HtmlFiles() {
+    Write-Log INFO "Installing HTML files"
+    mkdir -p /usr/share/nginx/html
     
-    # Create nginx user
-    if ! id nginx >/dev/null 2>&1; then
-        useradd --system --home /var/cache/nginx --shell /sbin/nologin --comment "nginx user" nginx
-        log_info "Created nginx user"
-    fi
+    cat > /usr/share/nginx/html/index.html <<'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+</body>
+</html>
+EOF
     
-    # Create directories
-    mkdir -p /var/cache/nginx/{client_temp,proxy_temp,fastcgi_temp,uwsgi_temp,scgi_temp}
-    mkdir -p /var/log/nginx
-    mkdir -p /etc/nginx/conf.d
-    
-    # Install NGINX
-    cd "$BUILD_DIR/nginx-${NGINX_VERSION}" || exit 1
-    make install &>"$LOG_DIR/nginx-install.log"
-    
-    if [ $? -eq 0 ]; then
-        log_success "NGINX installed successfully"
-    else
-        log_error "NGINX installation failed. Check $LOG_DIR/nginx-install.log"
-        exit 1
-    fi
-    
-    # Set permissions
-    chown -R nginx:nginx /var/cache/nginx /var/log/nginx
-    chmod 755 /var/cache/nginx /var/log/nginx
-    
-    # Create basic configuration
-    create_basic_config
-    
-    # Create mime.types file
-    create_mime_types
-    
-    # Create systemd service
-    create_systemd_service
-    
-    log_success "NGINX installation completed"
+    chmod 0644 /usr/share/nginx/html/*.html 2>/dev/null || true
 }
 
-# Create basic NGINX configuration
-create_basic_config() {
-    cat > /etc/nginx/nginx.conf << 'EOF'
+New-SelfSignedCertificate() {
+    Write-Log INFO "Generating self-signed TLS certificate"
+    mkdir -p /etc/nginx/ssl
+    
+    local ssl_bin
+    ssl_bin=$(command -v openssl || true)
+    
+    # Prefer built OpenSSL binary
+    if [[ -x "${BUILD_DIR}/openssl-install/bin/openssl" ]]; then
+        ssl_bin="${BUILD_DIR}/openssl-install/bin/openssl"
+    fi
+    
+    # Fallback: install openssl
+    if [[ -z "$ssl_bin" ]]; then
+        local mgr
+        mgr=$(Detect-PkgMgr)
+        case $mgr in
+            apt) apt-get install -y openssl >/dev/null 2>&1 ;;
+            dnf) dnf install -y openssl >/dev/null 2>&1 ;;
+        esac
+        ssl_bin=$(command -v openssl || true)
+    fi
+    
+    [[ -n "$ssl_bin" ]] || Stop-Script "openssl not found"
+    
+    local output
+    
+    # Setup library path for custom OpenSSL
+    if [[ "$ssl_bin" == *"/openssl-install/bin/openssl" ]]; then
+        local openssl_libdir="${BUILD_DIR}/openssl-install/lib"
+        if [[ -d "${BUILD_DIR}/openssl-install/lib64" ]]; then
+            openssl_libdir="${BUILD_DIR}/openssl-install/lib64"
+        fi
+        
+        if ! output=$(LD_LIBRARY_PATH="$openssl_libdir:${LD_LIBRARY_PATH:-}" OPENSSL_CONF=/dev/null "$ssl_bin" req -x509 -newkey ec \
+            -pkeyopt ec_paramgen_curve:secp384r1 \
+            -days 365 -nodes \
+            -keyout /etc/nginx/ssl/nginx.key \
+            -out /etc/nginx/ssl/nginx.crt \
+            -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' 2>&1); then
+            Write-Log ERROR "OpenSSL output: $output"
+            Stop-Script "Certificate generation failed"
+        fi
+    else
+        if ! output=$(OPENSSL_CONF=/dev/null "$ssl_bin" req -x509 -newkey ec \
+            -pkeyopt ec_paramgen_curve:secp384r1 \
+            -days 365 -nodes \
+            -keyout /etc/nginx/ssl/nginx.key \
+            -out /etc/nginx/ssl/nginx.crt \
+            -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' 2>&1); then
+            Write-Log ERROR "OpenSSL output: $output"
+            Stop-Script "Certificate generation failed"
+        fi
+    fi
+    
+    chmod 600 /etc/nginx/ssl/nginx.key
+    chmod 644 /etc/nginx/ssl/nginx.crt
+}
+
+New-NginxConfig() {
+    Write-Log INFO "Creating nginx configuration"
+    
+    cat > /etc/nginx/nginx.conf <<'EOF'
+load_module /etc/nginx/modules/ngx_http_zstd_filter_module.so;
+load_module /etc/nginx/modules/ngx_http_zstd_static_module.so;
+load_module /etc/nginx/modules/ngx_http_headers_more_filter_module.so;
+load_module /etc/nginx/modules/ngx_http_acme_module.so;
+
 user nginx;
 worker_processes auto;
 error_log /var/log/nginx/error.log warn;
@@ -376,195 +530,157 @@ pid /run/nginx.pid;
 
 events {
     worker_connections 1024;
-    use epoll;
 }
 
 http {
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
 
-    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
-                    '$status $body_bytes_sent "$http_referer" '
-                    '"$http_user_agent" "$http_x_forwarded_for"';
+    server_tokens off;
+    more_set_headers 'Server: nginx';
 
-    access_log /var/log/nginx/access.log main;
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
 
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-    keepalive_timeout 65;
-    
-    # SSL Configuration
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache shared:SSL:50m;
-    ssl_session_timeout 1d;
-    
-    # Security headers
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
-    
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile        on;
+    tcp_nopush      on;
+    tcp_nodelay     on;
+    keepalive_timeout  65;
+    types_hash_max_size 2048;
+
     # Gzip compression
-    gzip on;
+    gzip  on;
     gzip_vary on;
     gzip_proxied any;
     gzip_comp_level 6;
-    gzip_types text/plain text/css text/xml application/json application/javascript 
-               application/xml+rss application/atom+xml image/svg+xml;
-    
-    # Include additional configurations
-    include /etc/nginx/conf.d/*.conf;
-    
-    # Default server
+    gzip_min_length 1024;
+    gzip_types text/plain text/css text/xml text/javascript application/json application/javascript application/xml+rss application/rss+xml font/truetype font/opentype application/vnd.ms-fontobject image/svg+xml;
+
+    # Zstd compression
+    zstd on;
+    zstd_comp_level 6;
+    zstd_min_length 1024;
+    zstd_types text/plain text/css text/xml text/javascript application/json application/javascript application/xml+rss application/rss+xml font/truetype font/opentype application/vnd.ms-fontobject image/svg+xml;
+
+    # SSL/TLS configuration
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    # TLS 1.2 ciphers — ECDSA-only (matches the ECDSA certificate generated below).
+    # TLS 1.3 ciphers are built-in and always secure; no need to list them.
+    ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256;
+    ssl_ecdh_curve X25519MLKEM768:X25519:prime256v1:secp384r1;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+    ssl_buffer_size 4k;
+
+    # QUIC configuration
+    quic_retry on;
+    # 0-RTT disabled: no replay attack protection configured at application layer
+    ssl_early_data off;
+
     server {
-        listen 80 default_server;
-        listen [::]:80 default_server;
+        listen 80;
+        listen [::]:80;
         server_name _;
-        root /usr/share/nginx/html;
-        
+        return 301 https://$host$request_uri;
+    }
+
+    server {
+        listen 443 ssl;
+        listen [::]:443 ssl;
+        listen 443 quic reuseport;
+        listen [::]:443 quic reuseport;
+
+        http2 on;
+        http3 on;
+
+        server_name localhost;
+
+        ssl_certificate /etc/nginx/ssl/nginx.crt;
+        ssl_certificate_key /etc/nginx/ssl/nginx.key;
+
+        add_header Alt-Svc 'h3=":443"; ma=86400' always;
+        add_header X-Protocol $server_protocol always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+        add_header Cross-Origin-Opener-Policy "same-origin" always;
+
         location / {
-            index index.html index.htm;
+            root   /usr/share/nginx/html;
+            index  index.html index.htm;
         }
-        
-        error_page 404 /404.html;
-        error_page 500 502 503 504 /50x.html;
+
+        error_page   500 502 503 504  /50x.html;
         location = /50x.html {
-            root /usr/share/nginx/html;
+            root   /usr/share/nginx/html;
         }
     }
 }
 EOF
-
-    # Create default index.html
-    mkdir -p /usr/share/nginx/html
-    cat > /usr/share/nginx/html/index.html << 'EOF'
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Welcome to NGINX</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        h1 { color: #333; }
-    </style>
-</head>
-<body>
-    <h1>Welcome to NGINX!</h1>
-    <p>If you see this page, the web server is successfully installed and working.</p>
-    <p>NGINX has been compiled with OpenSSL for HTTP/3 support.</p>
-</body>
-</html>
-EOF
 }
 
-# Create mime.types file
-create_mime_types() {
-    cat > /etc/nginx/mime.types << 'EOF'
-types {
-    text/html                             html htm shtml;
-    text/css                              css;
-    text/xml                              xml;
-    image/gif                             gif;
-    image/jpeg                            jpeg jpg;
-    application/javascript                js;
-    application/atom+xml                  atom;
-    application/rss+xml                   rss;
+# ============================================================================
+# Install/Remove Functions
+# ============================================================================
 
-    text/mathml                           mml;
-    text/plain                            txt;
-    text/vnd.sun.j2me.app-descriptor      jad;
-    text/vnd.wap.wml                      wml;
-    text/x-component                      htc;
+Install-Nginx() {
+    Write-Log INFO "Installing Nginx"
+    
+    # Backup existing configuration
+    if [[ -d /etc/nginx ]]; then
+        mkdir -p "$BACKUP_DIR"
+        cp -a /etc/nginx "$BACKUP_DIR/" || true
+    fi
+    
+    # Install binaries
+    cd "$BUILD_DIR/nginx"
+    local output
+    if ! output=$(make install 2>&1); then
+        Write-Log ERROR "Install output: $(echo "$output" | tail -10)"
+        Stop-Script "Nginx install failed"
+    fi
+    
+    # Create directories
+    mkdir -p /etc/nginx/{conf.d,sites-available,sites-enabled}
+    mkdir -p "${NGINX_MODULES_PATH}"
+    mkdir -p /var/log/nginx /var/cache/nginx "${NGINX_PREFIX}/html"
+    mkdir -p /var/lib/nginx/tmp/{client_body,proxy,fastcgi,uwsgi,scgi}
 
-    image/avif                            avif;
-    image/png                             png;
-    image/svg+xml                         svg svgz;
-    image/tiff                            tif tiff;
-    image/vnd.wap.wbmp                    wbmp;
-    image/webp                            webp;
-    image/x-icon                          ico;
-    image/x-jng                           jng;
-    image/x-ms-bmp                        bmp;
+    # Symlink /etc/nginx/modules -> real modules dir (matches Fedora/RHEL convention)
+    if [[ ! -L /etc/nginx/modules ]]; then
+        ln -sf "${NGINX_MODULES_PATH}" /etc/nginx/modules
+    fi
 
-    font/woff                             woff;
-    font/woff2                            woff2;
+    # Install dynamic modules
+    cp objs/*.so "${NGINX_MODULES_PATH}/" 2>/dev/null || true
+    cp "$BUILD_DIR/nginx-acme/objs/ngx_http_acme_module.so" "${NGINX_MODULES_PATH}/" 2>/dev/null || true
 
-    application/java-archive              jar war ear;
-    application/json                      json;
-    application/mac-binhex40              hqx;
-    application/msword                    doc;
-    application/pdf                       pdf;
-    application/postscript                ps eps ai;
-    application/rtf                       rtf;
-    application/vnd.apple.mpegurl         m3u8;
-    application/vnd.google-earth.kml+xml  kml;
-    application/vnd.google-earth.kmz      kmz;
-    application/vnd.ms-excel              xls;
-    application/vnd.ms-fontobject         eot;
-    application/vnd.ms-powerpoint         ppt;
-    application/vnd.oasis.opendocument.graphics        odg;
-    application/vnd.oasis.opendocument.presentation    odp;
-    application/vnd.oasis.opendocument.spreadsheet     ods;
-    application/vnd.oasis.opendocument.text            odt;
-    application/vnd.openxmlformats-officedocument.presentationml.presentation    pptx;
-    application/vnd.openxmlformats-officedocument.spreadsheetml.sheet             xlsx;
-    application/vnd.openxmlformats-officedocument.wordprocessingml.document       docx;
-    application/vnd.wap.wmlc              wmlc;
-    application/wasm                      wasm;
-    application/x-7z-compressed           7z;
-    application/x-cocoa                   cco;
-    application/x-java-archive-diff       jardiff;
-    application/x-java-jnlp-file          jnlp;
-    application/x-makeself                run;
-    application/x-perl                    pl pm;
-    application/x-pilot                   prc pdb;
-    application/x-rar-compressed          rar;
-    application/x-redhat-package-manager  rpm;
-    application/x-sea                     sea;
-    application/x-shockwave-flash         swf;
-    application/x-stuffit                 sit;
-    application/x-tcl                     tcl tk;
-    application/x-x509-ca-cert            der pem crt;
-    application/x-xpinstall               xpi;
-    application/xhtml+xml                 xhtml;
-    application/xspf+xml                  xspf;
-    application/zip                       zip;
+    # Install configuration files
+    Install-HtmlFiles
+    New-SelfSignedCertificate
+    New-NginxConfig
 
-    application/octet-stream              bin exe dll;
-    application/octet-stream              deb;
-    application/octet-stream              dmg;
-    application/octet-stream              iso img;
-    application/octet-stream              msi msp msm;
+    # Create nginx user
+    if ! id nginx >/dev/null 2>&1; then
+        useradd -r -s /sbin/nologin nginx || true
+    fi
 
-    audio/midi                            mid midi kar;
-    audio/mpeg                            mp3;
-    audio/ogg                             ogg;
-    audio/x-m4a                           m4a;
-    audio/x-realaudio                     ra;
-
-    video/3gpp                            3gpp 3gp;
-    video/mp2t                            ts;
-    video/mp4                             mp4;
-    video/mpeg                            mpeg mpg;
-    video/quicktime                       mov;
-    video/webm                            webm;
-    video/x-flv                           flv;
-    video/x-m4v                           m4v;
-    video/x-mng                           mng;
-    video/x-ms-asf                        asx asf;
-    video/x-ms-wmv                        wmv;
-    video/x-msvideo                       avi;
-}
-EOF
-}
-
-# Create systemd service
-create_systemd_service() {
-    cat > /etc/systemd/system/nginx.service << 'EOF'
+    chown -R nginx:nginx /var/log/nginx /var/cache/nginx /var/lib/nginx
+    chmod 755 /etc/nginx/conf.d "${NGINX_MODULES_PATH}"
+    
+    # Create systemd service
+    cat > /etc/systemd/system/nginx.service <<'EOF'
 [Unit]
-Description=The NGINX HTTP and reverse proxy server
-After=network.target remote-fs.target nss-lookup.target
+Description=Nginx HTTP Server
+After=network.target
 
 [Service]
 Type=forking
@@ -573,357 +689,128 @@ ExecStartPre=/usr/sbin/nginx -t
 ExecStart=/usr/sbin/nginx
 ExecReload=/usr/sbin/nginx -s reload
 ExecStop=/bin/kill -s QUIT $MAINPID
-PrivateTmp=true
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
     
     systemctl daemon-reload
-    systemctl enable nginx
-    log_info "Created and enabled systemd service"
+    systemctl enable nginx >/dev/null 2>&1
+    nginx -t && systemctl start nginx
+    
+    Write-Log INFO "Nginx ${NGINX_VERSION} with OpenSSL ${OPENSSL_VERSION} installed"
+    Write-Log INFO "Access: https://localhost"
+    Write-Log INFO "Manage nginx with: systemctl {start|stop|reload|restart|status} nginx"
+    nginx -V 2>&1 | head -n1 || true
+    
+    Test-NginxInstallation || Write-Log WARN "Post-install checks detected issues"
 }
 
-# Test NGINX configuration
-test_configuration() {
-    log_step "Testing NGINX configuration"
+Test-NginxInstallation() {
+    Write-Log INFO "Running post-install checks"
     
-    # Test configuration syntax
-    if nginx -t 2>/dev/null; then
-        log_success "NGINX configuration syntax is valid"
+    [[ -f /etc/nginx/ssl/nginx.crt && -f /etc/nginx/ssl/nginx.key ]] || {
+        Write-Log ERROR "SSL certificates missing"
+        return 1
+    }
+    
+    if [[ ! -f /etc/nginx/modules/ngx_http_acme_module.so ]]; then
+        Write-Log WARN "ACME module not found"
     else
-        log_error "NGINX configuration has syntax errors"
-        log_info "Running configuration test with verbose output:"
-        nginx -t
+        Write-Log INFO "ACME module present"
+    fi
+    
+    if ! nginx -t >/dev/null 2>&1; then
+        Write-Log ERROR "nginx -t failed"
         return 1
     fi
     
-    # Check if NGINX service can start
-    if systemctl is-active --quiet nginx; then
-        log_info "NGINX service is already running"
-    else
-        if systemctl start nginx; then
-            log_success "NGINX service started successfully"
-        else
-            log_error "Failed to start NGINX service"
-            return 1
-        fi
+    if ! systemctl is-active --quiet nginx 2>/dev/null; then
+        Write-Log WARN "Nginx service not active"
     fi
     
-    log_success "NGINX configuration test passed"
-}
-
-# Show installation summary
-show_summary() {
-    echo
-    echo -e "${BOLD}Installation Summary${NC}"
-    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    
-    if command -v nginx &>/dev/null; then
-        local nginx_version=$(nginx -v 2>&1 | grep -o 'nginx/[0-9.]*' || echo "Unknown")
-        local openssl_version=$(nginx -V 2>&1 | grep -o 'built with OpenSSL [0-9.]*' | cut -d' ' -f4 || echo "Unknown")
-        
-        echo -e "${GREEN}✓${NC} NGINX compiled and installed: $nginx_version"
-        echo -e "${GREEN}✓${NC} OpenSSL integration: $openssl_version"
-        echo -e "${GREEN}✓${NC} HTTP/3 support with QUIC protocol"
-        echo -e "${GREEN}✓${NC} Modern security configuration applied"
-        echo -e "${GREEN}✓${NC} Systemd service created and enabled"
-        
-        if systemctl is-active --quiet nginx; then
-            echo -e "${GREEN}✓${NC} NGINX service is running"
-        else
-            echo -e "${YELLOW}!${NC} NGINX service is not running"
-        fi
-    else
-        echo -e "${RED}✗${NC} NGINX installation may have failed"
-    fi
-    
-    echo
-    echo -e "${BOLD}Service Management${NC}"
-    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "Start NGINX:    ${BLUE}sudo systemctl start nginx${NC}"
-    echo -e "Stop NGINX:     ${BLUE}sudo systemctl stop nginx${NC}"
-    echo -e "Restart NGINX:  ${BLUE}sudo systemctl restart nginx${NC}"
-    echo -e "Enable NGINX:   ${BLUE}sudo systemctl enable nginx${NC}"
-    echo -e "Status:         ${BLUE}sudo systemctl status nginx${NC}"
-    echo -e "Test config:    ${BLUE}sudo nginx -t${NC}"
-    echo -e "Reload config:  ${BLUE}sudo nginx -s reload${NC}"
-    echo
-    echo -e "${BOLD}Connection Information${NC}"
-    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "HTTP Port:      ${BLUE}80${NC}"
-    echo -e "HTTPS Port:     ${BLUE}443${NC}"
-    echo -e "Config file:    ${BLUE}/etc/nginx/nginx.conf${NC}"
-    echo -e "Site configs:   ${BLUE}/etc/nginx/conf.d/${NC}"
-    echo -e "Document root:  ${BLUE}/usr/share/nginx/html${NC}"
-    echo -e "Log files:      ${BLUE}/var/log/nginx/${NC}"
-    echo -e "Backup:         ${BLUE}$BACKUP_DIR${NC}"
-    
-    # Show server IP addresses
-    echo -e "Server IPs:     ${BLUE}$(hostname -I | tr ' ' '\n' | head -3 | tr '\n' ' ')${NC}"
-    echo
-    echo -e "${BOLD}Security Notes${NC}"
-    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "• Modern SSL/TLS configuration with TLS 1.2/1.3"
-    echo -e "• HTTP/3 support with QUIC protocol enabled"
-    echo -e "• Security headers configured (X-Frame-Options, X-Content-Type-Options)"
-    echo -e "• Gzip compression enabled for better performance"
-    echo -e "• Built with latest OpenSSL for enhanced security"
-    echo -e "• Strong SSL ciphers and protocols enforced"
-    echo
-    echo -e "${YELLOW}Connect with:${NC} ${BLUE}http://$(hostname -I | awk '{print $1}')${NC}"
-    echo
-}
-
-# Compile and install NGINX with hardened configuration
-install() {
-    log_info "Starting NGINX ${NGINX_VERSION} installation with OpenSSL ${OPENSSL_VERSION}"
-    
-    # Safety check for SSH sessions
-    if [[ -n "${SSH_CONNECTION:-}" ]] && [[ "${FORCE_SSH_INSTALL:-}" != "1" ]]; then
-        log_error "Running in SSH session! This will affect web services."
-        log_warn "If you have console access, run: FORCE_SSH_INSTALL=1 $0 install"
-        log_warn "Or use 'screen' or 'tmux' to maintain session during restart"
-        exit 1
-    fi
-    
-    # Confirm installation
-    if [[ "${CONFIRM:-}" != "yes" ]]; then
-        if [[ -t 0 ]]; then
-            # Interactive mode
-            read -rp "Proceed with NGINX installation? This will compile and install NGINX with OpenSSL. [y/N] " answer
-            [[ "${answer,,}" != "y" ]] && { log_error "Installation cancelled"; exit 0; }
-        else
-            # Non-interactive mode (piped)
-            log_error "Non-interactive mode detected. Use: curl ... | CONFIRM=yes sudo bash -s install"
-            exit 0
-        fi
-    else
-        log_info "Installation confirmed via CONFIRM=yes environment variable"
-    fi
-    
-    check_root
-    print_header
-    
-    backup_existing
-    install_dependencies
-    download_sources
-    build_openssl
-    build_nginx
-    install_nginx
-    test_configuration
-    
-    # Enable and start NGINX service
-    systemctl enable nginx
-    systemctl restart nginx
-    
-    show_summary
-    
-    log_success "NGINX installation completed successfully!"
-}
-
-# Remove NGINX installation and restore original configuration
-remove() {
-    log_info "Removing NGINX installation..."
-    
-    # Confirm removal
-    if [[ "${CONFIRM:-}" != "yes" ]]; then
-        if [[ -t 0 ]]; then
-            # Interactive mode
-            read -rp "Remove NGINX installation? This will uninstall NGINX and clean up all files. [y/N] " answer
-            [[ "${answer,,}" != "y" ]] && { log_error "Removal cancelled"; exit 0; }
-        else
-            # Non-interactive mode (piped)
-            log_error "Non-interactive mode detected. Use: curl ... | CONFIRM=yes sudo bash -s remove"
-            exit 0
-        fi
-    fi
-    
-    # Stop NGINX service if running
     if systemctl is-active --quiet nginx 2>/dev/null; then
-        log_info "Stopping NGINX service..."
-        systemctl stop nginx
+        Write-Log INFO "Nginx service is active"
     fi
-    
-    # Disable service
-    if systemctl is-enabled --quiet nginx 2>/dev/null; then
-        log_info "Disabling NGINX service..."
-        systemctl disable nginx
-    fi
-    
-    # Remove systemd service file
-    if [[ -f /etc/systemd/system/nginx.service ]]; then
-        rm -f /etc/systemd/system/nginx.service
-        systemctl daemon-reload
-        log_info "Removed systemd service"
-    fi
-    
-    # Remove NGINX files and directories
-    rm -rf "$PREFIX"
-    rm -f /usr/sbin/nginx
-    rm -rf /etc/nginx
-    rm -rf /var/log/nginx
-    rm -rf /var/cache/nginx
-    rm -rf /usr/share/nginx
-    
-    # Remove nginx user
-    if id nginx >/dev/null 2>&1; then
-        userdel nginx 2>/dev/null || true
-        log_info "Removed nginx user"
-    fi
-    
-    log_success "NGINX installation removed successfully"
-    log_warn "NGINX service has been stopped and disabled"
-    log_info "Configuration backup remains in: $BACKUP_DIR"
+
+    curl -k https://localhost -I >/dev/null 2>&1 || Write-Log WARN "curl to https://localhost failed"
+
+    return 0
 }
 
-# Verify NGINX installation and configuration
-verify() {
-    log_info "Verifying NGINX installation..."
-    
-    local issues=0
-    
-    # Check if NGINX binary exists and is executable
-    if [[ -x /usr/sbin/nginx ]]; then
-        local nginx_version=$(nginx -v 2>&1 | grep -o 'nginx/[0-9.]*' || echo "Unknown")
-        log_success "NGINX binary installed: $nginx_version"
-    else
-        log_error "NGINX binary not found or not executable"
-        ((issues++))
-    fi
-    
-    # Check configuration file
-    if [[ -f /etc/nginx/nginx.conf ]]; then
-        log_success "NGINX configuration file exists: /etc/nginx/nginx.conf"
-        
-        # Test configuration
-        if nginx -t 2>/dev/null; then
-            log_success "NGINX configuration syntax is valid"
-        else
-            log_error "NGINX configuration has syntax errors"
-            ((issues++))
-        fi
-    else
-        log_error "NGINX configuration file not found"
-        ((issues++))
-    fi
-    
-    # Check service status
-    if systemctl is-active --quiet nginx 2>/dev/null; then
-        log_success "NGINX service is running"
-    else
-        log_warn "NGINX service is not running"
-    fi
-    
-    if systemctl is-enabled --quiet nginx 2>/dev/null; then
-        log_success "NGINX service is enabled"
-    else
-        log_warn "NGINX service is not enabled"
-    fi
-    
-    # Check OpenSSL integration
-    if nginx -V 2>&1 | grep -q "built with OpenSSL"; then
-        local openssl_version=$(nginx -V 2>&1 | grep -o 'built with OpenSSL [0-9.]*' | cut -d' ' -f4 || echo "Unknown")
-        log_success "OpenSSL integration: $openssl_version"
-    else
-        log_error "OpenSSL integration not found"
-        ((issues++))
-    fi
-    
-    # Check HTTP/3 support
-    if nginx -V 2>&1 | grep -q "http_v3_module"; then
-        log_success "HTTP/3 support: enabled"
-    else
-        log_warn "HTTP/3 support: not enabled"
-    fi
-    
-    # Check directories and permissions
-    local dirs=("/var/log/nginx" "/var/cache/nginx" "/etc/nginx" "/usr/share/nginx/html")
-    for dir in "${dirs[@]}"; do
-        if [[ -d "$dir" ]]; then
-            log_success "Directory exists: $dir"
-        else
-            log_error "Directory missing: $dir"
-            ((issues++))
+Remove-Nginx() {
+    Write-Log INFO "Removing Nginx"
+
+    systemctl stop nginx 2>/dev/null || true
+    systemctl disable nginx 2>/dev/null || true
+    rm -f /etc/systemd/system/nginx.service
+    systemctl daemon-reload 2>/dev/null || true
+
+    rm -rf \
+        /usr/sbin/nginx \
+        /etc/nginx \
+        /var/log/nginx \
+        /var/cache/nginx \
+        /var/lib/nginx \
+        "${NGINX_PREFIX}" \
+        "${NGINX_LIBDIR}/nginx"
+    userdel nginx 2>/dev/null || true
+
+    Write-Log INFO "Nginx removed"
+}
+
+Test-RunningWebServers() {
+    local ports_in_use=()
+
+    for port in 80 443; do
+        local pid
+        pid=$(lsof -ti :"$port" 2>/dev/null | head -n1 || true)
+        if [[ -n "$pid" ]]; then
+            local proc
+            proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+            ports_in_use+=("$port ($proc)")
+            Write-Log WARN "Port $port in use by: $proc"
         fi
     done
-    
-    # Check nginx user
-    if id nginx >/dev/null 2>&1; then
-        log_success "NGINX user exists"
-    else
-        log_error "NGINX user missing"
-        ((issues++))
-    fi
-    
-    # Check listening ports
-    if command -v ss &>/dev/null; then
-        local http_ports=$(ss -tlnp | grep :80 | wc -l)
-        if [ "$http_ports" -gt 0 ]; then
-            log_success "NGINX is listening on port 80"
+
+    if [[ ${#ports_in_use[@]} -gt 0 ]]; then
+        read -r -p "Stop conflicting services? [y/N]: " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            systemctl stop apache2 2>/dev/null || true
+            systemctl stop httpd 2>/dev/null || true
+            systemctl stop nginx 2>/dev/null || true
+            Write-Log INFO "Services stopped"
         else
-            log_warn "NGINX is not listening on port 80"
+            Stop-Script "Cannot proceed with ports in use: ${ports_in_use[*]}"
         fi
     fi
-    
-    echo
-    if [[ $issues -eq 0 ]]; then
-        log_success "NGINX installation verification passed!"
-        return 0
-    else
-        log_error "NGINX installation verification failed with $issues issues"
-        return 1
-    fi
 }
 
-# Main function
-main() {
-    case "${1:-help}" in
-        install)
-            install
-            ;;
-        remove)
-            check_root
-            remove
-            ;;
-        verify)
-            verify
-            ;;
-        *)
-            echo
-            echo -e "${BOLD}NGINX Compiler and Installer${NC}"
-            echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "Usage: $0 {install|remove|verify}"
-            echo
-            echo "  install - Build and install NGINX with OpenSSL from source"
-            echo "  remove  - Remove NGINX installation and clean up system"
-            echo "  verify  - Check current NGINX installation status"
-            echo
-            echo "Environment variables:"
-            echo "  CONFIRM=yes         - Skip installation confirmation"
-            echo "  FORCE_SSH_INSTALL=1 - Allow installation over SSH (risky!)"
-            echo "  NGINX_VERSION       - NGINX version (default: $NGINX_VERSION)"
-            echo "  OPENSSL_VERSION     - OpenSSL version (default: $OPENSSL_VERSION)"
-            echo "  PCRE2_VERSION       - PCRE2 version (default: $PCRE2_VERSION)"
-            echo "  ZLIB_VERSION        - zlib version (default: $ZLIB_VERSION)"
-            echo
-            echo "Examples:"
-            echo "  $0 install                    # Interactive installation"
-            echo "  CONFIRM=yes $0 install        # Non-interactive installation"
-            echo "  $0 verify                     # Check installation"
-            echo "  $0 remove                     # Remove installation"
-            echo
-            echo "Features:"
-            echo "  • Compiles NGINX from source with latest OpenSSL"
-            echo "  • HTTP/3 support with QUIC protocol"
-            echo "  • Modern security configurations"
-            echo "  • Optimized for performance and security"
-            echo "  • Systemd service integration"
-            echo "  • Comprehensive verification and cleanup"
-            echo
-            ;;
-    esac
-}
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
-# Run main function
-main "$@"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+
+case "${1:-install}" in
+    install)
+        Update-SystemPackages
+        Test-RunningWebServers
+        Install-Dependencies
+        Get-Sources
+        Build-Nginx
+        Install-Nginx
+        echo
+        echo "Installation log: $LOG_FILE"
+        ;;
+    remove)
+        Remove-Nginx
+        echo
+        echo "Removal log: $LOG_FILE"
+        ;;
+    *)
+        echo "Usage: $0 {install|remove}"
+        exit 1
+        ;;
+esac
