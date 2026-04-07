@@ -119,3 +119,4 @@ check_os
 # Main execution
 install_pre_reqs || handle_error $? "Failed installing pre-requisites"
 configure_repo "$NODE_VERSION" || handle_error $? "Failed configuring repository"
+apt install nodejs -y
