@@ -6,12 +6,12 @@ set -euo pipefail
 # ============================================================================
 #
 # Description:
-#   Builds and installs NGINX with OpenSSL 3.6, HTTP/3, zstd compression,
+#   Builds and installs NGINX with OpenSSL, HTTP/3, zstd compression,
 #   and ACME support on Linux.
 #
 # Usage:
-#   ./install-nginx.sh install    - Build and install NGINX
-#   ./install-nginx.sh remove     - Uninstall NGINX
+#   ./nginx_installer.sh install    - Build and install NGINX
+#   ./nginx_installer.sh remove     - Uninstall NGINX
 #
 # ============================================================================
 
@@ -26,12 +26,12 @@ fi
 # ============================================================================
 
 # NGINX
-NGINX_VERSION="1.29.5"
-NGINX_SHA256="6744768a4114880f37b13a0443244e731bcb3130c0a065d7e37d8fd589ade374"
+NGINX_VERSION="1.30.0"
+NGINX_SHA256="058188c64bf22baecaa72b809a6318a4f9ba623889c554feab03f7cb853ab31b"
 
 # OpenSSL
-OPENSSL_VERSION="3.6.1"
-OPENSSL_SHA256="b1bfedcd5b289ff22aee87c9d600f515767ebf45f77168cb6d64f231f518a82e"
+OPENSSL_VERSION="4.0.0"
+OPENSSL_SHA256="c32cf49a959c4f345f9606982dd36e7d28f7c58b19c2e25d75624d2b3d2f79ac"
 
 # PCRE2
 PCRE2_VERSION="10.47"
@@ -50,8 +50,8 @@ ZSTD_MODULE_VERSION="0.1.1"
 ZSTD_MODULE_SHA256="707d534f8ca4263ff043066db15eac284632aea875f9fe98c96cea9529e15f41"
 
 # ACME Module
-ACME_MODULE_VERSION="0.3.1"
-ACME_MODULE_SHA256="be3d3d10f042930a3bf348731698eadb7003d224a863c53b719ccd28721572c3"
+ACME_MODULE_VERSION="0.4.1"
+ACME_MODULE_SHA256="b4f99f971bd0bebc89b2037f3afeaa3281004fe434de558df87d69cab2be1f22"
 
 # ============================================================================
 # Static Configuration
@@ -126,6 +126,8 @@ Detect-PkgMgr() {
         echo "apt"
     elif command -v dnf >/dev/null 2>&1; then
         echo "dnf"
+    elif command -v pacman >/dev/null 2>&1; then
+        echo "pacman"
     else
         echo "unknown"
     fi
@@ -153,8 +155,13 @@ Install-Dependencies() {
         dnf)
             dnf install -y -q gcc gcc-c++ make pcre2-devel zlib-devel libzstd-devel curl perl cargo pkgconf-pkg-config clang gawk cmake >/dev/null 2>&1
             ;;
+        pacman)
+            if ! pacman -Sy --noconfirm --needed base-devel pcre2 zstd curl clang gawk cmake pkgconf >/dev/null 2>&1; then
+                Write-Log WARN "pacman install failed, will try rustup for cargo. Note: zlib is not required (zlib-ng-compat provides it)."
+            fi
+            ;;
         *)
-            Stop-Script "Unsupported package manager. Only apt and dnf are supported."
+            Stop-Script "Unsupported package manager. Only apt, dnf and pacman are supported."
             ;;
     esac
     
@@ -170,12 +177,12 @@ Install-Dependencies() {
 
 Update-SystemPackages() {
     [[ $EUID -eq 0 ]] || Stop-Script "Run as root"
-    
+
     Write-Log INFO "Updating system packages"
-    
+
     local mgr
     mgr=$(Detect-PkgMgr)
-    
+
     case $mgr in
         apt)
             export DEBIAN_FRONTEND=noninteractive
@@ -183,13 +190,19 @@ Update-SystemPackages() {
             apt-get upgrade -y -q || Stop-Script "apt-get upgrade failed"
             ;;
         dnf)
-            dnf upgrade -y -q || Stop-Script "dnf upgrade failed"
+            dnf upgrade -y -q 2>&1 | grep -E '(Complete|Error|Failed)' || true
+            if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+                Stop-Script "dnf upgrade failed"
+            fi
+            ;;
+        pacman)
+            pacman -Syu --noconfirm >/dev/null 2>&1 || Write-Log WARN "pacman upgrade failed"
             ;;
         *)
             Write-Log WARN "Unable to detect package manager"
             ;;
     esac
-    
+
     Write-Log INFO "System packages updated"
 }
 
@@ -291,7 +304,9 @@ Build-Nginx() {
                 use_system_ssl=true
                 Write-Log WARN "OpenSSL build failed"
             else
-                make install_sw 2>&1 | grep -v '^DEBUG:' || true
+                if ! make install_sw >/dev/null 2>&1; then
+                    Stop-Script "OpenSSL make install_sw failed"
+                fi
                 ssl_opt="--with-openssl=$BUILD_DIR/openssl"
                 Write-Log INFO "OpenSSL built successfully"
             fi
@@ -305,6 +320,7 @@ Build-Nginx() {
         case $mgr in
             apt) apt-get install -y libssl-dev >/dev/null 2>&1 ;;
             dnf) dnf install -y openssl-devel >/dev/null 2>&1 ;;
+            pacman) pacman -Sy --noconfirm openssl >/dev/null 2>&1 ;;
         esac
         Write-Log INFO "Using system OpenSSL"
     fi
@@ -317,14 +333,9 @@ Build-Nginx() {
     export CC=gcc
     
     # Verify libzstd availability
-    if command -v ldconfig >/dev/null 2>&1; then
-        if ! ldconfig -p 2>/dev/null | grep -q "libzstd.so"; then
-            Stop-Script "Shared libzstd not found. Install libzstd-dev/devel"
-        fi
-    else
-        if [[ ! -f /usr/lib/libzstd.so && ! -f /usr/lib64/libzstd.so && ! -f /usr/local/lib/libzstd.so ]]; then
-            Stop-Script "Shared libzstd not found"
-        fi
+    if [[ ! -f /usr/lib/libzstd.so && ! -f /usr/lib/libzstd.so.1 && 
+          ! -f /usr/lib64/libzstd.so && ! -f /usr/lib64/libzstd.so.1 ]]; then
+        Stop-Script "Shared libzstd not found. Install libzstd-dev/devel"
     fi
     
     export LDFLAGS="-lzstd"
@@ -432,15 +443,20 @@ Build-Nginx() {
 Install-HtmlFiles() {
     Write-Log INFO "Installing HTML files"
     mkdir -p /usr/share/nginx/html
-    
+
+    if [[ -f /usr/share/nginx/html/index.html ]]; then
+        Write-Log INFO "Existing HTML files preserved"
+        return 0
+    fi
+
     cat > /usr/share/nginx/html/index.html <<'EOF'
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Welcome to nginx!</title>
-<style>
-    body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
-</style>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 <h1>Welcome to nginx!</h1>
@@ -449,14 +465,27 @@ working. Further configuration is required.</p>
 </body>
 </html>
 EOF
-    
-    chmod 0644 /usr/share/nginx/html/*.html 2>/dev/null || true
+
+    cat > /usr/share/nginx/html/style.css <<'EOF'
+body {
+    width: 35em;
+    margin: 0 auto;
+    font-family: Tahoma, Verdana, Arial, sans-serif;
+}
+EOF
+
+    chmod 0644 /usr/share/nginx/html/*.html /usr/share/nginx/html/*.css 2>/dev/null || true
 }
 
 New-SelfSignedCertificate() {
     Write-Log INFO "Generating self-signed TLS certificate"
     mkdir -p /etc/nginx/ssl
-    
+
+    if [[ -f /etc/nginx/ssl/nginx.key && -f /etc/nginx/ssl/nginx.crt ]]; then
+        Write-Log INFO "Existing SSL certificate preserved"
+        return 0
+    fi
+
     local ssl_bin
     ssl_bin=$(command -v openssl || true)
     
@@ -472,6 +501,7 @@ New-SelfSignedCertificate() {
         case $mgr in
             apt) apt-get install -y openssl >/dev/null 2>&1 ;;
             dnf) dnf install -y openssl >/dev/null 2>&1 ;;
+            pacman) pacman -Sy --noconfirm openssl >/dev/null 2>&1 ;;
         esac
         ssl_bin=$(command -v openssl || true)
     fi
@@ -549,7 +579,8 @@ http {
     tcp_nopush      on;
     tcp_nodelay     on;
     keepalive_timeout  65;
-    types_hash_max_size 2048;
+    types_hash_max_size 4096;
+    types_hash_bucket_size 128;
 
     # Gzip compression
     gzip  on;
@@ -648,6 +679,9 @@ Install-Nginx() {
         Stop-Script "Nginx install failed"
     fi
     
+    # Verify nginx binary exists
+    [[ -x /usr/sbin/nginx ]] || Stop-Script "NGINX binary not found after install"
+    
     # Create directories
     mkdir -p /etc/nginx/{conf.d,sites-available,sites-enabled}
     mkdir -p "${NGINX_MODULES_PATH}"
@@ -666,7 +700,11 @@ Install-Nginx() {
     # Install configuration files
     Install-HtmlFiles
     New-SelfSignedCertificate
-    New-NginxConfig
+    if [[ ! -f /etc/nginx/nginx.conf ]]; then
+        New-NginxConfig
+    else
+        Write-Log INFO "Existing nginx.conf preserved"
+    fi
 
     # Create nginx user
     if ! id nginx >/dev/null 2>&1; then
@@ -674,6 +712,9 @@ Install-Nginx() {
     fi
 
     chown -R nginx:nginx /var/log/nginx /var/cache/nginx /var/lib/nginx
+    chown root:nginx /etc/nginx/ssl
+    chmod 640 /etc/nginx/ssl/nginx.key
+    chmod 644 /etc/nginx/ssl/nginx.crt
     chmod 755 /etc/nginx/conf.d "${NGINX_MODULES_PATH}"
     
     # Create systemd service
