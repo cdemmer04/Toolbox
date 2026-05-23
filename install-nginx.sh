@@ -10,8 +10,8 @@ set -euo pipefail
 #   and ACME support on Linux.
 #
 # Usage:
-#   ./install-nginx.sh install    - Build and install NGINX
-#   ./install-nginx.sh remove     - Uninstall NGINX
+#   ./nginx_installer.sh install    - Build and install NGINX
+#   ./nginx_installer.sh remove     - Uninstall NGINX
 #
 # ============================================================================
 
@@ -26,8 +26,8 @@ fi
 # ============================================================================
 
 # NGINX
-NGINX_VERSION="1.31.0"
-NGINX_SHA256="6d5b00d45393af2e4e7c52a442d2a198f0ccbc7678ed062a46f403edd833ebaa"
+NGINX_VERSION="1.31.1"
+NGINX_SHA256="9fcaaeb8f22544b09a19a761f3412c4112215422401634bebdd1296a403cc4bc"
 
 # PCRE2
 PCRE2_VERSION="10.47"
@@ -50,14 +50,14 @@ ACME_MODULE_VERSION="0.4.1"
 ACME_MODULE_SHA256="b4f99f971bd0bebc89b2037f3afeaa3281004fe434de558df87d69cab2be1f22"
 
 # ============================================================================
-# Static Configuration
+# Configuration
 # ============================================================================
 
 BUILD_DIR="/var/tmp/nginx-build-$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/var/lib/nginx-backup-$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="/var/log/nginx-installer-$(date +%Y%m%d-%H%M%S).log"
 
-# FHS-compliant install paths (matching what dnf/rpm would use)
+# install paths (matching what dnf/rpm would use)
 NGINX_PREFIX="/usr/share/nginx"
 case "$(uname -m)" in
     x86_64|aarch64) NGINX_LIBDIR="/usr/lib64" ;;
