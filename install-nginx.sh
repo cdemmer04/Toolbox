@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -euo pipefaili
 
 # ============================================================================
 # NGINX Installer Script for Linux (Bash)
@@ -10,8 +10,8 @@ set -euo pipefail
 #   and ACME support on Linux.
 #
 # Usage:
-#   ./nginx_installer.sh install    - Build and install NGINX
-#   ./nginx_installer.sh remove     - Uninstall NGINX
+#   ./install-nginx.sh install    - Build and install NGINX
+#   ./install-nginx.sh remove     - Uninstall NGINX
 #
 # ============================================================================
 
