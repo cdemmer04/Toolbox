@@ -145,14 +145,14 @@ Install-Dependencies() {
         apt)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq >/dev/null 2>&1
-            apt-get install -y build-essential libpcre2-dev zlib1g-dev libzstd-dev libssl-dev curl gcc make cargo pkg-config clang gawk cmake >/dev/null 2>&1
+            apt-get install -y build-essential libpcre2-dev zlib1g-dev libzstd-dev libssl-dev openssl curl gcc make cargo pkg-config clang gawk cmake >/dev/null 2>&1
             ;;
         dnf)
-            dnf install -y -q gcc gcc-c++ make pcre2-devel zlib-devel libzstd-devel openssl-devel curl perl cargo pkgconf-pkg-config clang gawk cmake >/dev/null 2>&1
+            dnf install -y -q gcc gcc-c++ make pcre2-devel zlib-devel libzstd-devel openssl openssl-devel curl perl cargo pkgconf-pkg-config clang gawk cmake >/dev/null 2>&1
             ;;
         pacman)
-            if ! pacman -Sy --noconfirm --needed base-devel pcre2 zstd openssl curl clang gawk cmake pkgconf >/dev/null 2>&1; then
-                Write-Log WARN "pacman install failed, will try rustup for cargo. Note: zlib is not required (zlib-ng-compat provides it)."
+            if ! pacman -S --noconfirm --needed base-devel pcre2 zstd openssl curl clang gawk cmake pkgconf perl >/dev/null 2>&1; then
+                Stop-Script "pacman install failed"
             fi
             ;;
         *)
@@ -190,7 +190,7 @@ Update-SystemPackages() {
             fi
             ;;
         pacman)
-            pacman -Syu --noconfirm >/dev/null 2>&1 || Write-Log WARN "pacman upgrade failed"
+            pacman -Syu --noconfirm >/dev/null 2>&1 || Stop-Script "pacman upgrade failed"
             ;;
         *)
             Write-Log WARN "Unable to detect package manager"
@@ -219,7 +219,7 @@ Get-Sources() {
     Write-Log INFO "Extracting archives"
     
     # Clean previous extractions
-    rm -rf nginx openssl pcre2 zlib headers-more zstd-module nginx-acme 2>/dev/null || true
+    rm -rf nginx pcre2 zlib headers-more zstd-module nginx-acme 2>/dev/null || true
     
     tar xzf nginx.tgz && mv "nginx-${NGINX_VERSION}" nginx
     tar xzf pcre2.tgz && mv "pcre2-${PCRE2_VERSION}" pcre2
@@ -241,11 +241,13 @@ Build-Nginx() {
 
     # Check disk space in /var/tmp
     local tmp_space
-    tmp_space=$(df /var/tmp | tail -1 | awk '{print $4}')
+    local tmpdir="/var/tmp"
+    tmp_space=$(df -P "$tmpdir" | tail -1 | awk '{print $4}')
     if [[ $tmp_space -lt 1048576 ]]; then
-        Write-Log WARN "Low disk space in /var/tmp, using build directory"
-        export TMPDIR="$BUILD_DIR"
+        Write-Log WARN "Low disk space in $tmpdir, using build directory"
+        tmpdir="$BUILD_DIR"
     fi
+    export TMPDIR="$tmpdir"
 
     # Ensure cc symlink exists
     if ! command -v cc >/dev/null 2>&1; then
@@ -257,7 +259,6 @@ Build-Nginx() {
     Write-Log INFO "Building Nginx ${NGINX_VERSION}"
     cd "$BUILD_DIR/nginx" || Stop-Script "Nginx source missing"
     
-    export TMPDIR="$BUILD_DIR"
     export CC=gcc
     
     # Verify libzstd availability
@@ -265,9 +266,14 @@ Build-Nginx() {
         if ! ldconfig -p 2>/dev/null | grep -q "libzstd.so"; then
             Stop-Script "Shared libzstd not found. Install libzstd-dev/devel"
         fi
-    elif [[ ! -f /usr/lib/libzstd.so && ! -f /usr/lib/libzstd.so.1 &&
-            ! -f /usr/lib64/libzstd.so && ! -f /usr/lib64/libzstd.so.1 &&
-            ! -f /usr/local/lib/libzstd.so ]]; then
+    elif ! compgen -G "/usr/lib/libzstd.so*" >/dev/null &&
+         ! compgen -G "/usr/lib64/libzstd.so*" >/dev/null &&
+         ! compgen -G "/usr/local/lib/libzstd.so*" >/dev/null &&
+         ! compgen -G "/usr/local/lib64/libzstd.so*" >/dev/null &&
+         ! compgen -G "/lib/libzstd.so*" >/dev/null &&
+         ! compgen -G "/lib64/libzstd.so*" >/dev/null &&
+         ! compgen -G "/usr/lib/*-linux-gnu/libzstd.so*" >/dev/null &&
+         ! compgen -G "/lib/*-linux-gnu/libzstd.so*" >/dev/null; then
         Stop-Script "Shared libzstd not found. Install libzstd-dev/devel"
     fi
     
