@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefaili
+set -euo pipefail
 
 # ============================================================================
 # NGINX Installer Script for Linux (Bash)
