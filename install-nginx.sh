@@ -145,14 +145,14 @@ Install-Dependencies() {
         apt)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq >/dev/null 2>&1
-            apt-get install -y build-essential libpcre2-dev zlib1g-dev libzstd-dev libssl-dev openssl curl gcc make cargo pkg-config clang gawk cmake >/dev/null 2>&1
+            apt-get install -y build-essential libpcre2-dev zlib1g-dev libzstd-dev libssl-dev curl gcc make cargo pkg-config clang gawk cmake >/dev/null 2>&1
             ;;
         dnf)
-            dnf install -y -q gcc gcc-c++ make pcre2-devel zlib-devel libzstd-devel openssl openssl-devel curl perl cargo pkgconf-pkg-config clang gawk cmake >/dev/null 2>&1
+            dnf install -y -q gcc gcc-c++ make pcre2-devel zlib-devel libzstd-devel openssl-devel curl perl cargo pkgconf-pkg-config clang gawk cmake >/dev/null 2>&1
             ;;
         pacman)
-            if ! pacman -S --noconfirm --needed base-devel pcre2 zstd openssl curl clang gawk cmake pkgconf perl >/dev/null 2>&1; then
-                Stop-Script "pacman install failed"
+            if ! pacman -Sy --noconfirm --needed base-devel pcre2 zstd openssl curl clang gawk cmake pkgconf >/dev/null 2>&1; then
+                Write-Log WARN "pacman install failed, will try rustup for cargo. Note: zlib is not required (zlib-ng-compat provides it)."
             fi
             ;;
         *)
@@ -190,7 +190,7 @@ Update-SystemPackages() {
             fi
             ;;
         pacman)
-            pacman -Syu --noconfirm >/dev/null 2>&1 || Stop-Script "pacman upgrade failed"
+            pacman -Syu --noconfirm >/dev/null 2>&1 || Write-Log WARN "pacman upgrade failed"
             ;;
         *)
             Write-Log WARN "Unable to detect package manager"
@@ -219,7 +219,7 @@ Get-Sources() {
     Write-Log INFO "Extracting archives"
     
     # Clean previous extractions
-    rm -rf nginx pcre2 zlib headers-more zstd-module nginx-acme 2>/dev/null || true
+    rm -rf nginx openssl pcre2 zlib headers-more zstd-module nginx-acme 2>/dev/null || true
     
     tar xzf nginx.tgz && mv "nginx-${NGINX_VERSION}" nginx
     tar xzf pcre2.tgz && mv "pcre2-${PCRE2_VERSION}" pcre2
@@ -241,13 +241,11 @@ Build-Nginx() {
 
     # Check disk space in /var/tmp
     local tmp_space
-    local tmpdir="/var/tmp"
-    tmp_space=$(df -P "$tmpdir" | tail -1 | awk '{print $4}')
+    tmp_space=$(df /var/tmp | tail -1 | awk '{print $4}')
     if [[ $tmp_space -lt 1048576 ]]; then
-        Write-Log WARN "Low disk space in $tmpdir, using build directory"
-        tmpdir="$BUILD_DIR"
+        Write-Log WARN "Low disk space in /var/tmp, using build directory"
+        export TMPDIR="$BUILD_DIR"
     fi
-    export TMPDIR="$tmpdir"
 
     # Ensure cc symlink exists
     if ! command -v cc >/dev/null 2>&1; then
@@ -259,6 +257,7 @@ Build-Nginx() {
     Write-Log INFO "Building Nginx ${NGINX_VERSION}"
     cd "$BUILD_DIR/nginx" || Stop-Script "Nginx source missing"
     
+    export TMPDIR="$BUILD_DIR"
     export CC=gcc
     
     # Verify libzstd availability
@@ -266,14 +265,9 @@ Build-Nginx() {
         if ! ldconfig -p 2>/dev/null | grep -q "libzstd.so"; then
             Stop-Script "Shared libzstd not found. Install libzstd-dev/devel"
         fi
-    elif ! compgen -G "/usr/lib/libzstd.so*" >/dev/null &&
-         ! compgen -G "/usr/lib64/libzstd.so*" >/dev/null &&
-         ! compgen -G "/usr/local/lib/libzstd.so*" >/dev/null &&
-         ! compgen -G "/usr/local/lib64/libzstd.so*" >/dev/null &&
-         ! compgen -G "/lib/libzstd.so*" >/dev/null &&
-         ! compgen -G "/lib64/libzstd.so*" >/dev/null &&
-         ! compgen -G "/usr/lib/*-linux-gnu/libzstd.so*" >/dev/null &&
-         ! compgen -G "/lib/*-linux-gnu/libzstd.so*" >/dev/null; then
+    elif [[ ! -f /usr/lib/libzstd.so && ! -f /usr/lib/libzstd.so.1 &&
+            ! -f /usr/lib64/libzstd.so && ! -f /usr/lib64/libzstd.so.1 &&
+            ! -f /usr/local/lib/libzstd.so ]]; then
         Stop-Script "Shared libzstd not found. Install libzstd-dev/devel"
     fi
     
@@ -355,7 +349,10 @@ Build-Nginx() {
     fi
     
     mkdir -p "$BUILD_DIR/nginx-acme/objs"
-    cp target/release/libnginx_acme.so "$BUILD_DIR/nginx-acme/objs/ngx_http_acme_module.so" || true
+    local acme_so="target/release/libnginx_acme.so"
+    [[ -f "$acme_so" ]] || Stop-Script "ACME module not built: $acme_so missing (cargo build may have failed)"
+    cp "$acme_so" "$BUILD_DIR/nginx-acme/objs/ngx_http_acme_module.so" \
+        || Stop-Script "Failed to stage ACME module: cp failed (check disk space or permissions)"
     
     Write-Log INFO "ACME module built successfully"
     Write-Log INFO "Build complete"
@@ -559,7 +556,7 @@ Install-Nginx() {
     fi
     
     # Install binaries
-    cd "$BUILD_DIR/nginx"
+    cd "$BUILD_DIR/nginx" || Stop-Script "Cannot cd to $BUILD_DIR/nginx"
     local output
     if ! output=$(make install 2>&1); then
         Write-Log ERROR "Install output: $(echo "$output" | tail -10)"
@@ -652,14 +649,17 @@ EOF
     
     systemctl daemon-reload
     systemctl enable nginx >/dev/null 2>&1
-    nginx -t && systemctl start nginx
+    if ! /usr/sbin/nginx -t; then
+        Stop-Script "nginx configuration test failed — check the error above"
+    fi
+    systemctl start nginx || Stop-Script "Failed to start nginx service"
     
     local openssl_ver
     openssl_ver=$(openssl version 2>/dev/null | awk '{print $1" "$2}' || echo "OpenSSL unknown")
     Write-Log INFO "Nginx ${NGINX_VERSION} with ${openssl_ver} (system) installed"
     Write-Log INFO "Access: https://localhost"
     Write-Log INFO "Manage nginx with: systemctl {start|stop|reload|restart|status} nginx"
-    nginx -V 2>&1 | head -n1 || true
+    /usr/sbin/nginx -V 2>&1 | head -n1 || true
     
     Test-NginxInstallation || Write-Log WARN "Post-install checks detected issues"
 }
@@ -678,7 +678,7 @@ Test-NginxInstallation() {
         Write-Log INFO "ACME module present"
     fi
     
-    if ! nginx -t >/dev/null 2>&1; then
+    if ! /usr/sbin/nginx -t >/dev/null 2>&1; then
         Write-Log ERROR "nginx -t failed"
         return 1
     fi
@@ -719,10 +719,27 @@ Remove-Nginx() {
 
 Test-RunningWebServers() {
     local ports_in_use=()
+    local has_lsof=0 has_ss=0
+    command -v lsof >/dev/null 2>&1 && has_lsof=1
+    command -v ss   >/dev/null 2>&1 && has_ss=1
+
+    if [[ $has_lsof -eq 0 && $has_ss -eq 0 ]]; then
+        Write-Log WARN "Neither lsof nor ss available; skipping port conflict check"
+        return 0
+    fi
 
     for port in 80 443; do
         local pid
-        pid=$(lsof -ti :"$port" 2>/dev/null | head -n1 || true)
+        if [[ $has_lsof -eq 1 ]]; then
+            pid=$(lsof -ti :"$port" 2>/dev/null | head -n1 || true)
+        else
+            pid=$(ss -tlnp 2>/dev/null \
+                | awk -v p="${port}" '
+                    $0 ~ ":"p"[[:space:]]" {
+                        if (match($0, /pid=[0-9]+/)) { print substr($0, RSTART+4, RLENGTH-4); exit }
+                    }' \
+                || true)
+        fi
         if [[ -n "$pid" ]]; then
             local proc
             proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
