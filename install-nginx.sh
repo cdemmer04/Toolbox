@@ -6,7 +6,7 @@ set -euo pipefail
 # ============================================================================
 #
 # Description:
-#   Builds and installs NGINX with OpenSSL 3.6, HTTP/3, zstd compression,
+#   Builds and installs NGINX with OpenSSL, HTTP/3, zstd compression,
 #   and ACME support on Linux.
 #
 # Usage:
@@ -26,12 +26,8 @@ fi
 # ============================================================================
 
 # NGINX
-NGINX_VERSION="1.29.5"
-NGINX_SHA256="6744768a4114880f37b13a0443244e731bcb3130c0a065d7e37d8fd589ade374"
-
-# OpenSSL
-OPENSSL_VERSION="3.6.1"
-OPENSSL_SHA256="b1bfedcd5b289ff22aee87c9d600f515767ebf45f77168cb6d64f231f518a82e"
+NGINX_VERSION="1.31.1"
+NGINX_SHA256="9fcaaeb8f22544b09a19a761f3412c4112215422401634bebdd1296a403cc4bc"
 
 # PCRE2
 PCRE2_VERSION="10.47"
@@ -50,18 +46,18 @@ ZSTD_MODULE_VERSION="0.1.1"
 ZSTD_MODULE_SHA256="707d534f8ca4263ff043066db15eac284632aea875f9fe98c96cea9529e15f41"
 
 # ACME Module
-ACME_MODULE_VERSION="0.3.1"
-ACME_MODULE_SHA256="be3d3d10f042930a3bf348731698eadb7003d224a863c53b719ccd28721572c3"
+ACME_MODULE_VERSION="0.4.1"
+ACME_MODULE_SHA256="b4f99f971bd0bebc89b2037f3afeaa3281004fe434de558df87d69cab2be1f22"
 
 # ============================================================================
-# Static Configuration
+# Configuration
 # ============================================================================
 
-BUILD_DIR="/tmp/nginx-build-$(date +%Y%m%d-%H%M%S)"
+BUILD_DIR="/var/tmp/nginx-build-$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/var/lib/nginx-backup-$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="/var/log/nginx-installer-$(date +%Y%m%d-%H%M%S).log"
 
-# FHS-compliant install paths (matching what dnf/rpm would use)
+# install paths (matching what dnf/rpm would use)
 NGINX_PREFIX="/usr/share/nginx"
 case "$(uname -m)" in
     x86_64|aarch64) NGINX_LIBDIR="/usr/lib64" ;;
@@ -71,7 +67,6 @@ NGINX_MODULES_PATH="${NGINX_LIBDIR}/nginx/modules"
 
 # Download URLs
 NGINX_URL="https://github.com/nginx/nginx/releases/download/release-${NGINX_VERSION}/nginx-${NGINX_VERSION}.tar.gz"
-OPENSSL_URL="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
 PCRE2_URL="https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz"
 ZLIB_URL="https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
 HEADERS_MORE_URL="https://github.com/openresty/headers-more-nginx-module/archive/refs/tags/v${HEADERS_MORE_VERSION}.tar.gz"
@@ -126,6 +121,8 @@ Detect-PkgMgr() {
         echo "apt"
     elif command -v dnf >/dev/null 2>&1; then
         echo "dnf"
+    elif command -v pacman >/dev/null 2>&1; then
+        echo "pacman"
     else
         echo "unknown"
     fi
@@ -148,13 +145,18 @@ Install-Dependencies() {
         apt)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq >/dev/null 2>&1
-            apt-get install -y build-essential libpcre2-dev zlib1g-dev libzstd-dev curl gcc make cargo pkg-config clang gawk cmake >/dev/null 2>&1
+            apt-get install -y build-essential libpcre2-dev zlib1g-dev libzstd-dev libssl-dev curl gcc make cargo pkg-config clang gawk cmake >/dev/null 2>&1
             ;;
         dnf)
-            dnf install -y -q gcc gcc-c++ make pcre2-devel zlib-devel libzstd-devel curl perl cargo pkgconf-pkg-config clang gawk cmake >/dev/null 2>&1
+            dnf install -y -q gcc gcc-c++ make pcre2-devel zlib-devel libzstd-devel openssl-devel curl perl cargo pkgconf-pkg-config clang gawk cmake >/dev/null 2>&1
+            ;;
+        pacman)
+            if ! pacman -Sy --noconfirm --needed base-devel pcre2 zstd openssl curl clang gawk cmake pkgconf >/dev/null 2>&1; then
+                Write-Log WARN "pacman install failed, will try rustup for cargo. Note: zlib is not required (zlib-ng-compat provides it)."
+            fi
             ;;
         *)
-            Stop-Script "Unsupported package manager. Only apt and dnf are supported."
+            Stop-Script "Unsupported package manager. Only apt, dnf and pacman are supported."
             ;;
     esac
     
@@ -170,12 +172,12 @@ Install-Dependencies() {
 
 Update-SystemPackages() {
     [[ $EUID -eq 0 ]] || Stop-Script "Run as root"
-    
+
     Write-Log INFO "Updating system packages"
-    
+
     local mgr
     mgr=$(Detect-PkgMgr)
-    
+
     case $mgr in
         apt)
             export DEBIAN_FRONTEND=noninteractive
@@ -183,13 +185,18 @@ Update-SystemPackages() {
             apt-get upgrade -y -q || Stop-Script "apt-get upgrade failed"
             ;;
         dnf)
-            dnf upgrade -y -q || Stop-Script "dnf upgrade failed"
+            if ! dnf upgrade -y -q >/dev/null 2>&1; then
+                Stop-Script "dnf upgrade failed"
+            fi
+            ;;
+        pacman)
+            pacman -Syu --noconfirm >/dev/null 2>&1 || Write-Log WARN "pacman upgrade failed"
             ;;
         *)
             Write-Log WARN "Unable to detect package manager"
             ;;
     esac
-    
+
     Write-Log INFO "System packages updated"
 }
 
@@ -203,7 +210,6 @@ Get-Sources() {
     Write-Log INFO "Downloading sources"
     
     Get-File "$NGINX_URL" "nginx.tgz" "$NGINX_SHA256"
-    Get-File "$OPENSSL_URL" "openssl.tgz" "$OPENSSL_SHA256"
     Get-File "$PCRE2_URL" "pcre2.tgz" "$PCRE2_SHA256"
     Get-File "$ZLIB_URL" "zlib.tgz" "$ZLIB_SHA256"
     Get-File "$HEADERS_MORE_URL" "headers.tgz" "$HEADERS_MORE_SHA256"
@@ -216,7 +222,6 @@ Get-Sources() {
     rm -rf nginx openssl pcre2 zlib headers-more zstd-module nginx-acme 2>/dev/null || true
     
     tar xzf nginx.tgz && mv "nginx-${NGINX_VERSION}" nginx
-    tar xzf openssl.tgz && mv "openssl-${OPENSSL_VERSION}" openssl
     tar xzf pcre2.tgz && mv "pcre2-${PCRE2_VERSION}" pcre2
     tar xzf zlib.tgz && mv "zlib-${ZLIB_VERSION}" zlib
     tar xzf headers.tgz && mv "headers-more-nginx-module-${HEADERS_MORE_VERSION}" headers-more
@@ -231,84 +236,23 @@ Get-Sources() {
 # ============================================================================
 
 Build-Nginx() {
-    local use_system_ssl=false
-    local ssl_opt=""
-    
-    # Detect WSL ARM64 and fall back to system OpenSSL
-    if [[ $(uname -r) =~ microsoft ]] && [[ $(uname -m) == aarch64 ]]; then
-        Write-Log WARN "WSL ARM64 detected - using system OpenSSL"
-        use_system_ssl=true
-    fi
-    
     # Clean compiler temp files (not the build dir itself — managed by EXIT trap)
     rm -rf /tmp/cc* /tmp/tmp.* 2>/dev/null || true
-    
-    # Check disk space in /tmp
+
+    # Check disk space in /var/tmp
     local tmp_space
-    tmp_space=$(df /tmp | tail -1 | awk '{print $4}')
+    tmp_space=$(df /var/tmp | tail -1 | awk '{print $4}')
     if [[ $tmp_space -lt 1048576 ]]; then
-        Write-Log WARN "Low disk space in /tmp, using build directory"
+        Write-Log WARN "Low disk space in /var/tmp, using build directory"
         export TMPDIR="$BUILD_DIR"
     fi
-    
+
     # Ensure cc symlink exists
     if ! command -v cc >/dev/null 2>&1; then
         ln -sf /usr/bin/gcc /usr/local/bin/cc 2>/dev/null || true
         export PATH="/usr/local/bin:$PATH"
     fi
-    
-    # Build OpenSSL standalone for ACME module
-    if [[ $use_system_ssl == false ]]; then
-        Write-Log INFO "Building OpenSSL ${OPENSSL_VERSION} (Standalone)"
-        cd "$BUILD_DIR/openssl" || Stop-Script "OpenSSL source missing"
-        
-        local arch
-        arch=$(uname -m)
-        case $arch in
-            x86_64)  arch="linux-x86_64" ;;
-            aarch64) arch="linux-aarch64" ;;
-            armv7l)  arch="linux-armv4" ;;
-            *)       arch="linux-generic64" ;;
-        esac
-        
-        export TMPDIR="$BUILD_DIR"
-        export CC=gcc
-        
-        local output configure_exit
-        output=$(./Configure "$arch" \
-            --prefix="$(pwd)/../openssl-install" \
-            --openssldir="$(pwd)/../openssl-install/ssl" \
-            enable-tls1_3 shared -fPIC 2>&1) && configure_exit=0 || configure_exit=$?
-        output=$(printf '%s\n' "$output" | grep -v '^DEBUG:' | grep -v '^No value given' || true)
-        if [[ $configure_exit -ne 0 ]]; then
-            use_system_ssl=true
-            Write-Log WARN "OpenSSL configure failed"
-        else
-            local make_exit
-            output=$(make -j"$(nproc)" 2>&1) && make_exit=0 || make_exit=$?
-            output=$(printf '%s\n' "$output" | grep -v '^DEBUG:' || true)
-            if [[ $make_exit -ne 0 ]]; then
-                use_system_ssl=true
-                Write-Log WARN "OpenSSL build failed"
-            else
-                make install_sw 2>&1 | grep -v '^DEBUG:' || true
-                ssl_opt="--with-openssl=$BUILD_DIR/openssl"
-                Write-Log INFO "OpenSSL built successfully"
-            fi
-        fi
-    fi
-    
-    # Fallback to system OpenSSL
-    if [[ $use_system_ssl == true ]]; then
-        local mgr
-        mgr=$(Detect-PkgMgr)
-        case $mgr in
-            apt) apt-get install -y libssl-dev >/dev/null 2>&1 ;;
-            dnf) dnf install -y openssl-devel >/dev/null 2>&1 ;;
-        esac
-        Write-Log INFO "Using system OpenSSL"
-    fi
-    
+
     # Build NGINX
     Write-Log INFO "Building Nginx ${NGINX_VERSION}"
     cd "$BUILD_DIR/nginx" || Stop-Script "Nginx source missing"
@@ -321,10 +265,10 @@ Build-Nginx() {
         if ! ldconfig -p 2>/dev/null | grep -q "libzstd.so"; then
             Stop-Script "Shared libzstd not found. Install libzstd-dev/devel"
         fi
-    else
-        if [[ ! -f /usr/lib/libzstd.so && ! -f /usr/lib64/libzstd.so && ! -f /usr/local/lib/libzstd.so ]]; then
-            Stop-Script "Shared libzstd not found"
-        fi
+    elif [[ ! -f /usr/lib/libzstd.so && ! -f /usr/lib/libzstd.so.1 &&
+            ! -f /usr/lib64/libzstd.so && ! -f /usr/lib64/libzstd.so.1 &&
+            ! -f /usr/local/lib/libzstd.so ]]; then
+        Stop-Script "Shared libzstd not found. Install libzstd-dev/devel"
     fi
     
     export LDFLAGS="-lzstd"
@@ -344,7 +288,6 @@ Build-Nginx() {
         --http-fastcgi-temp-path=/var/lib/nginx/tmp/fastcgi \
         --http-uwsgi-temp-path=/var/lib/nginx/tmp/uwsgi \
         --http-scgi-temp-path=/var/lib/nginx/tmp/scgi \
-        $ssl_opt \
         --with-pcre="$BUILD_DIR/pcre2" \
         --with-zlib="$BUILD_DIR/zlib" \
         --with-pcre-jit \
@@ -399,19 +342,6 @@ Build-Nginx() {
         source "$HOME/.cargo/env"
     fi
     
-    # Setup OpenSSL for Rust
-    if [[ -d "$BUILD_DIR/openssl-install" ]]; then
-        export OPENSSL_DIR="$BUILD_DIR/openssl-install"
-        if [[ -d "$BUILD_DIR/openssl-install/lib64" ]]; then
-            export OPENSSL_LIB_DIR="$BUILD_DIR/openssl-install/lib64"
-        else
-            export OPENSSL_LIB_DIR="$BUILD_DIR/openssl-install/lib"
-        fi
-        export OPENSSL_INCLUDE_DIR="$BUILD_DIR/openssl-install/include"
-        export OPENSSL_STATIC=1
-        Write-Log INFO "Using custom OpenSSL for ACME (Static Link): $OPENSSL_DIR"
-    fi
-    
     local cargo_output
     if ! cargo_output=$(cargo build --release 2>&1); then
         Write-Log ERROR "ACME build failed: $(echo "$cargo_output" | tail -20)"
@@ -419,7 +349,10 @@ Build-Nginx() {
     fi
     
     mkdir -p "$BUILD_DIR/nginx-acme/objs"
-    cp target/release/libnginx_acme.so "$BUILD_DIR/nginx-acme/objs/ngx_http_acme_module.so" || true
+    local acme_so="target/release/libnginx_acme.so"
+    [[ -f "$acme_so" ]] || Stop-Script "ACME module not built: $acme_so missing (cargo build may have failed)"
+    cp "$acme_so" "$BUILD_DIR/nginx-acme/objs/ngx_http_acme_module.so" \
+        || Stop-Script "Failed to stage ACME module: cp failed (check disk space or permissions)"
     
     Write-Log INFO "ACME module built successfully"
     Write-Log INFO "Build complete"
@@ -432,15 +365,15 @@ Build-Nginx() {
 Install-HtmlFiles() {
     Write-Log INFO "Installing HTML files"
     mkdir -p /usr/share/nginx/html
-    
+
     cat > /usr/share/nginx/html/index.html <<'EOF'
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Welcome to nginx!</title>
-<style>
-    body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
-</style>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 <h1>Welcome to nginx!</h1>
@@ -449,65 +382,41 @@ working. Further configuration is required.</p>
 </body>
 </html>
 EOF
-    
-    chmod 0644 /usr/share/nginx/html/*.html 2>/dev/null || true
+
+    cat > /usr/share/nginx/html/style.css <<'EOF'
+body {
+    width: 35em;
+    margin: 0 auto;
+    font-family: Tahoma, Verdana, Arial, sans-serif;
+}
+EOF
+
+    chmod 0644 /usr/share/nginx/html/*.html /usr/share/nginx/html/*.css 2>/dev/null || true
 }
 
 New-SelfSignedCertificate() {
     Write-Log INFO "Generating self-signed TLS certificate"
     mkdir -p /etc/nginx/ssl
-    
+
+    if [[ -f /etc/nginx/ssl/nginx.key && -f /etc/nginx/ssl/nginx.crt ]]; then
+        Write-Log INFO "Existing SSL certificate preserved"
+        return 0
+    fi
+
     local ssl_bin
     ssl_bin=$(command -v openssl || true)
-    
-    # Prefer built OpenSSL binary
-    if [[ -x "${BUILD_DIR}/openssl-install/bin/openssl" ]]; then
-        ssl_bin="${BUILD_DIR}/openssl-install/bin/openssl"
-    fi
-    
-    # Fallback: install openssl
-    if [[ -z "$ssl_bin" ]]; then
-        local mgr
-        mgr=$(Detect-PkgMgr)
-        case $mgr in
-            apt) apt-get install -y openssl >/dev/null 2>&1 ;;
-            dnf) dnf install -y openssl >/dev/null 2>&1 ;;
-        esac
-        ssl_bin=$(command -v openssl || true)
-    fi
-    
     [[ -n "$ssl_bin" ]] || Stop-Script "openssl not found"
-    
+
     local output
-    
-    # Setup library path for custom OpenSSL
-    if [[ "$ssl_bin" == *"/openssl-install/bin/openssl" ]]; then
-        local openssl_libdir="${BUILD_DIR}/openssl-install/lib"
-        if [[ -d "${BUILD_DIR}/openssl-install/lib64" ]]; then
-            openssl_libdir="${BUILD_DIR}/openssl-install/lib64"
-        fi
-        
-        if ! output=$(LD_LIBRARY_PATH="$openssl_libdir:${LD_LIBRARY_PATH:-}" OPENSSL_CONF=/dev/null "$ssl_bin" req -x509 -newkey ec \
-            -pkeyopt ec_paramgen_curve:secp384r1 \
-            -days 365 -nodes \
-            -keyout /etc/nginx/ssl/nginx.key \
-            -out /etc/nginx/ssl/nginx.crt \
-            -subj '/CN=localhost' \
-            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' 2>&1); then
-            Write-Log ERROR "OpenSSL output: $output"
-            Stop-Script "Certificate generation failed"
-        fi
-    else
-        if ! output=$(OPENSSL_CONF=/dev/null "$ssl_bin" req -x509 -newkey ec \
-            -pkeyopt ec_paramgen_curve:secp384r1 \
-            -days 365 -nodes \
-            -keyout /etc/nginx/ssl/nginx.key \
-            -out /etc/nginx/ssl/nginx.crt \
-            -subj '/CN=localhost' \
-            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' 2>&1); then
-            Write-Log ERROR "OpenSSL output: $output"
-            Stop-Script "Certificate generation failed"
-        fi
+    if ! output=$(OPENSSL_CONF=/dev/null "$ssl_bin" req -x509 -newkey ec \
+        -pkeyopt ec_paramgen_curve:secp384r1 \
+        -days 365 -nodes \
+        -keyout /etc/nginx/ssl/nginx.key \
+        -out /etc/nginx/ssl/nginx.crt \
+        -subj '/CN=localhost' \
+        -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' 2>&1); then
+        Write-Log ERROR "OpenSSL output: $output"
+        Stop-Script "Certificate generation failed"
     fi
     
     chmod 600 /etc/nginx/ssl/nginx.key
@@ -549,7 +458,8 @@ http {
     tcp_nopush      on;
     tcp_nodelay     on;
     keepalive_timeout  65;
-    types_hash_max_size 2048;
+    types_hash_max_size 4096;
+    types_hash_bucket_size 128;
 
     # Gzip compression
     gzip  on;
@@ -633,7 +543,12 @@ EOF
 
 Install-Nginx() {
     Write-Log INFO "Installing Nginx"
-    
+
+    local had_existing_nginx=false
+    [[ -d /etc/nginx ]] && had_existing_nginx=true
+    local had_existing_html=false
+    [[ -f /usr/share/nginx/html/index.html ]] && had_existing_html=true
+
     # Backup existing configuration
     if [[ -d /etc/nginx ]]; then
         mkdir -p "$BACKUP_DIR"
@@ -641,12 +556,15 @@ Install-Nginx() {
     fi
     
     # Install binaries
-    cd "$BUILD_DIR/nginx"
+    cd "$BUILD_DIR/nginx" || Stop-Script "Cannot cd to $BUILD_DIR/nginx"
     local output
     if ! output=$(make install 2>&1); then
         Write-Log ERROR "Install output: $(echo "$output" | tail -10)"
         Stop-Script "Nginx install failed"
     fi
+    
+    # Verify nginx binary exists
+    [[ -x /usr/sbin/nginx ]] || Stop-Script "NGINX binary not found after install"
     
     # Create directories
     mkdir -p /etc/nginx/{conf.d,sites-available,sites-enabled}
@@ -660,13 +578,44 @@ Install-Nginx() {
     fi
 
     # Install dynamic modules
-    cp objs/*.so "${NGINX_MODULES_PATH}/" 2>/dev/null || true
-    cp "$BUILD_DIR/nginx-acme/objs/ngx_http_acme_module.so" "${NGINX_MODULES_PATH}/" 2>/dev/null || true
+    local nginx_module_files=()
+    local module_file
+    while IFS= read -r module_file; do
+        nginx_module_files+=("$module_file")
+    done < <(compgen -G 'objs/*.so' || true)
+
+    if [[ ${#nginx_module_files[@]} -eq 0 ]]; then
+        Stop-Script "No NGINX dynamic modules found in $BUILD_DIR/nginx/objs"
+    fi
+    cp "${nginx_module_files[@]}" "${NGINX_MODULES_PATH}/" || Stop-Script "Failed to copy NGINX modules"
+
+    local acme_module="$BUILD_DIR/nginx-acme/objs/ngx_http_acme_module.so"
+    [[ -f "$acme_module" ]] || Stop-Script "ACME module not found: $acme_module"
+    cp "$acme_module" "${NGINX_MODULES_PATH}/" || Stop-Script "Failed to copy ACME module"
+
+    local required_modules=(
+        ngx_http_zstd_filter_module.so
+        ngx_http_zstd_static_module.so
+        ngx_http_headers_more_filter_module.so
+        ngx_http_acme_module.so
+    )
+    local module
+    for module in "${required_modules[@]}"; do
+        [[ -f "${NGINX_MODULES_PATH}/${module}" ]] || Stop-Script "Required module missing after install: ${module}"
+    done
 
     # Install configuration files
-    Install-HtmlFiles
+    if [[ $had_existing_html == false ]]; then
+        Install-HtmlFiles
+    else
+        Write-Log INFO "Existing HTML files preserved"
+    fi
     New-SelfSignedCertificate
-    New-NginxConfig
+    if [[ $had_existing_nginx == false ]]; then
+        New-NginxConfig
+    else
+        Write-Log INFO "Existing nginx.conf preserved"
+    fi
 
     # Create nginx user
     if ! id nginx >/dev/null 2>&1; then
@@ -674,6 +623,9 @@ Install-Nginx() {
     fi
 
     chown -R nginx:nginx /var/log/nginx /var/cache/nginx /var/lib/nginx
+    chown root:root /etc/nginx/ssl
+    chmod 600 /etc/nginx/ssl/nginx.key
+    chmod 644 /etc/nginx/ssl/nginx.crt
     chmod 755 /etc/nginx/conf.d "${NGINX_MODULES_PATH}"
     
     # Create systemd service
@@ -697,12 +649,17 @@ EOF
     
     systemctl daemon-reload
     systemctl enable nginx >/dev/null 2>&1
-    nginx -t && systemctl start nginx
+    if ! /usr/sbin/nginx -t; then
+        Stop-Script "nginx configuration test failed — check the error above"
+    fi
+    systemctl start nginx || Stop-Script "Failed to start nginx service"
     
-    Write-Log INFO "Nginx ${NGINX_VERSION} with OpenSSL ${OPENSSL_VERSION} installed"
+    local openssl_ver
+    openssl_ver=$(openssl version 2>/dev/null | awk '{print $1" "$2}' || echo "OpenSSL unknown")
+    Write-Log INFO "Nginx ${NGINX_VERSION} with ${openssl_ver} (system) installed"
     Write-Log INFO "Access: https://localhost"
     Write-Log INFO "Manage nginx with: systemctl {start|stop|reload|restart|status} nginx"
-    nginx -V 2>&1 | head -n1 || true
+    /usr/sbin/nginx -V 2>&1 | head -n1 || true
     
     Test-NginxInstallation || Write-Log WARN "Post-install checks detected issues"
 }
@@ -721,7 +678,7 @@ Test-NginxInstallation() {
         Write-Log INFO "ACME module present"
     fi
     
-    if ! nginx -t >/dev/null 2>&1; then
+    if ! /usr/sbin/nginx -t >/dev/null 2>&1; then
         Write-Log ERROR "nginx -t failed"
         return 1
     fi
@@ -762,10 +719,27 @@ Remove-Nginx() {
 
 Test-RunningWebServers() {
     local ports_in_use=()
+    local has_lsof=0 has_ss=0
+    command -v lsof >/dev/null 2>&1 && has_lsof=1
+    command -v ss   >/dev/null 2>&1 && has_ss=1
+
+    if [[ $has_lsof -eq 0 && $has_ss -eq 0 ]]; then
+        Write-Log WARN "Neither lsof nor ss available; skipping port conflict check"
+        return 0
+    fi
 
     for port in 80 443; do
         local pid
-        pid=$(lsof -ti :"$port" 2>/dev/null | head -n1 || true)
+        if [[ $has_lsof -eq 1 ]]; then
+            pid=$(lsof -ti :"$port" 2>/dev/null | head -n1 || true)
+        else
+            pid=$(ss -tlnp 2>/dev/null \
+                | awk -v p="${port}" '
+                    $0 ~ ":"p"[[:space:]]" {
+                        if (match($0, /pid=[0-9]+/)) { print substr($0, RSTART+4, RLENGTH-4); exit }
+                    }' \
+                || true)
+        fi
         if [[ -n "$pid" ]]; then
             local proc
             proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
